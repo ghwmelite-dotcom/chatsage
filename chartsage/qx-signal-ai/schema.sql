@@ -22,9 +22,14 @@ CREATE TABLE IF NOT EXISTS signals (
   mode TEXT DEFAULT 'screenshot', -- screenshot | live
   entry_price REAL,            -- live mode: entry at signal time
   sl REAL,                     -- live mode: stop-loss (1.5x ATR against)
-  tp REAL                      -- live mode: take-profit (3x ATR with, 1:2 R:R)
+  tp REAL,                     -- live mode: take-profit (3x ATR with, 1:2 R:R)
+  mfe_r REAL,                  -- max favorable excursion in R (vs SL distance)
+  mae_r REAL                   -- max adverse excursion in R
 );
 
 CREATE INDEX IF NOT EXISTS idx_signals_asset_class ON signals(asset_class);
 CREATE INDEX IF NOT EXISTS idx_signals_session ON signals(session);
 CREATE INDEX IF NOT EXISTS idx_signals_outcome ON signals(outcome);
+
+-- Calibration loop state (edge_override etc.)
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);

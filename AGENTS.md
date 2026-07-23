@@ -39,7 +39,15 @@ the screenshot endpoint `/analyze` remains for API use but has no UI. OTC reject
 ## Architecture invariants (do not break)
 - Direction is DERIVED server-side from prob_up (>=60 LONG, <=40 SHORT, else NO_TRADE)
 - Trade levels computed from ATR(14) on 5m: SL 1.5x, TP 3x (1:2 R:R) — model never sets prices
-- Auto-grader: walks real 1m candles; TP-first win, SL-first loss, both-in-candle = loss, 4h = breakeven
+- Auto-grader: walks real 1m candles; TP-first win, SL-first loss, both-in-candle = loss, 4h = breakeven;
+  records mfe_r/mae_r (R-multiples) per trade — geometry diagnostics surface in /stats.excursion
+- Correlation guard: BTCUSDT/ETHUSDT are drivers; same-direction alts suppressed when a
+  driver fires; concurrent same-direction crypto capped at 3
+- Calibration loop: nightly 22:05 UTC — realized WR per lean bucket (/stats.calibration);
+  edge_override in settings table retunes finalizeSignal's threshold once n>=50
+- /backtest: replays deterministic engines (confluence needs symbol; arb/om capped at 17d
+  by Twelve Data fetch depth); replay is an upper bound (no slippage/fees, funding=0)
+- Daily digest 21:05 UTC to Telegram
 - One open trade per asset; NO_TRADE never notifies Telegram
 - marketOpen(): Sun 21:00–Fri 21:00 UTC only; newsGuard(): ±45 min blackout around
   FOMC/CPI/NFP (NEWS_UTC list in code — H2 CPI dates approximate, verify at bls.gov)

@@ -850,55 +850,263 @@ function cryptoSignalMessage(s) {
 // Scan the universe (or one symbol); persist + notify. Deterministic — no LLM.
 async function cryptoScan(env, { symbol = null, notify = true } = {}) {
   const universe = symbol ? [symbol.toUpperCase()] : await cryptoUniverse(CRYPTO.TOP);
-  const emitted = [];
+  const candidates = [];
   const errors = [];
+
+  // 1. Evaluate everything concurrently
+  const queue = [...universe];
+  await Promise.all(
+    Array.from({ length: 4 }, async () => {
+      while (queue.length) {
+        const sym = queue.shift();
+        try {
+          const data = await loadSymbolData(sym);
+          const sig = cryptoEvaluate(data);
+          if (sig) candidates.push(sig);
+        } catch (e) {
+          errors.push(sym + ": " + (e.message || e));
+        }
+      }
+    })
+  );
+
+  // 2. Correlation guard — BTC/ETH drive the alt complex. A same-direction
+  // driver signal suppresses same-direction alts this scan (one bet, not eight).
+  candidates.sort((a, b) => b.score - a.score);
+  const DRIVERS = new Set(["BTCUSDT", "ETHUSDT"]);
+  const driverDirs = new Set(candidates.filter((c) => DRIVERS.has(c.symbol)).map((c) => c.direction));
+  const filtered = candidates.filter((c) => DRIVERS.has(c.symbol) || !driverDirs.has(c.direction));
+  const suppressed = candidates.length - filtered.length;
+
+  // 3. Cap concurrent same-direction crypto exposure at 3 (open + this scan)
+  const { results: openRows } = await env.DB.prepare(
+    `SELECT direction, COUNT(*) AS n FROM signals
+     WHERE mode='live' AND asset_class='crypto' AND outcome IS NULL AND direction != 'NO_TRADE'
+     GROUP BY direction`
+  ).all();
+  const openCount = { LONG: 0, SHORT: 0 };
+  for (const r of openRows) openCount[r.direction] = r.n;
+
+  const emitted = [];
   const since = new Date(Date.now() - CRYPTO.DEDUPE_HOURS * 3600e3).toISOString().slice(0, 19).replace("T", " ");
 
-  // modest concurrency
-  const queue = [...universe];
-  const workers = Array.from({ length: 4 }, async () => {
-    while (queue.length) {
-      const sym = queue.shift();
-      try {
-        const data = await loadSymbolData(sym);
-        const sig = cryptoEvaluate(data);
-        if (!sig) continue;
+  for (const sig of filtered) {
+    if (openCount[sig.direction] >= 3) continue;
 
-        // dedupe: same symbol+direction within 6h
-        const { results: dup } = await env.DB.prepare(
-          `SELECT COUNT(*) AS n FROM signals WHERE mode='live' AND asset=? AND direction=? AND created_at >= ?`
-        ).bind(sym, sig.direction, since).all();
-        if (dup[0].n > 0) continue;
+    // dedupe: same symbol+direction within 6h
+    const { results: dup } = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM signals WHERE mode='live' AND asset=? AND direction=? AND created_at >= ?`
+    ).bind(sig.symbol, sig.direction, since).all();
+    if (dup[0].n > 0) continue;
 
-        const signal = {
-          direction: sig.direction,
-          setup_type: "confluence_" + sig.grade.toLowerCase(),
-          prob_up: sig.direction === "LONG" ? sig.score : 100 - sig.score,
-          confidence: sig.score,
-          expiry_minutes: 1,
-          entry_timing: "market (live feed)",
-          entry_price: sig.entry,
-          sl: sig.sl,
-          tp: sig.tp1, // graded against TP1; TP2 kept in chart_read
-          reasoning: `Grade ${sig.grade} confluence (${sig.score}/100): ${sig.confluence_tags.join(" + ")}. ${sig.invalidation}`,
-        };
-        const id = await persistLiveSignal(
-          env,
-          { td: sym, class: "crypto" },
-          "n/a",
-          signal,
-          { engine: "confluence", grade: sig.grade, score: sig.score, tp1: sig.tp1, tp2: sig.tp2, rr: sig.rr_to_tp1, funding: sig.funding_rate, oi_pct: sig.oi_change_4h_pct, tags: sig.confluence_tags },
-          "H1"
-        );
-        emitted.push({ id, ...sig });
-        if (notify && sig.grade === "A") await notifyTelegram(env, cryptoSignalMessage(sig));
-      } catch (e) {
-        errors.push(sym + ": " + (e.message || e));
+    const signal = {
+      direction: sig.direction,
+      setup_type: "confluence_" + sig.grade.toLowerCase(),
+      prob_up: sig.direction === "LONG" ? sig.score : 100 - sig.score,
+      confidence: sig.score,
+      expiry_minutes: 1,
+      entry_timing: "market (live feed)",
+      entry_price: sig.entry,
+      sl: sig.sl,
+      tp: sig.tp1, // graded against TP1; TP2 kept in chart_read
+      reasoning: `Grade ${sig.grade} confluence (${sig.score}/100): ${sig.confluence_tags.join(" + ")}. ${sig.invalidation}`,
+    };
+    const id = await persistLiveSignal(
+      env,
+      { td: sig.symbol, class: "crypto" },
+      "n/a",
+      signal,
+      { engine: "confluence", grade: sig.grade, score: sig.score, tp1: sig.tp1, tp2: sig.tp2, rr: sig.rr_to_tp1, funding: sig.funding_rate, oi_pct: sig.oi_change_4h_pct, tags: sig.confluence_tags },
+      "H1"
+    );
+    emitted.push({ id, ...sig });
+    openCount[sig.direction]++;
+    if (notify && sig.grade === "A") await notifyTelegram(env, cryptoSignalMessage(sig));
+  }
+  return { scanned: universe.length, emitted, errors, suppressed };
+}
+
+/* ------------------------------------------------------------------ */
+/* Backtest — replay deterministic engines over historical candles     */
+/* No slippage/fees/funding in replay: results are an upper bound.     */
+/* ------------------------------------------------------------------ */
+
+function summarizeTrades(trades, note) {
+  const wins = trades.filter((t) => t.outcome === "win").length;
+  const losses = trades.filter((t) => t.outcome === "loss").length;
+  const breakevens = trades.length - wins - losses;
+  const decided = wins + losses;
+  return {
+    trades: trades.length,
+    wins, losses, breakevens,
+    win_rate: decided ? Math.round((1000 * wins) / decided) / 10 : null,
+    expectancy_r: trades.length
+      ? Math.round(((wins * 1.5 - losses) / trades.length) * 100) / 100
+      : null,
+    profit_factor_r: losses ? Math.round(((wins * 1.5) / losses) * 100) / 100 : wins ? Infinity : null,
+    by_grade: {
+      A: trades.filter((t) => t.grade === "A").length,
+      B: trades.filter((t) => t.grade === "B").length,
+    },
+    note,
+    sample: trades.slice(-10),
+  };
+}
+
+// Crypto confluence replay on one symbol, hourly evaluations, 1h-forward grading.
+async function backtestConfluence(symbol, days) {
+  const h1 = await bnKlines(symbol, "1h", Math.min(1000, days * 24 + 300));
+  const h4 = await bnKlines(symbol, "4h", Math.min(1000, days * 6 + 300));
+  const d1full = addIndicators(h1);
+  const d4full = addIndicators(h4);
+  const start = Math.max(300, d1full.length - days * 24);
+  const trades = [];
+  const nextAllowed = { LONG: 0, SHORT: 0 };
+  let d4i = 0;
+
+  for (let i = start; i < d1full.length - 1; i++) {
+    const tClose = d1full[i].t + 3600e3;
+    while (d4i < d4full.length - 1 && d4full[d4i + 1].t + 4 * 3600e3 <= tClose) d4i++;
+    if (d4i < 60) continue;
+    const data = { symbol, d4: d4full.slice(0, d4i + 1), d1: d1full.slice(0, i + 1), funding: 0, oiPct: null };
+    for (const dir of ["LONG", "SHORT"]) {
+      if (i < nextAllowed[dir]) continue;
+      const sig = evaluateDirection(data, dir, 0, null);
+      if (!sig) continue;
+      let outcome = "breakeven";
+      for (let j = i + 1; j <= Math.min(i + 4, d1full.length - 1); j++) {
+        const c = d1full[j];
+        const hitSL = dir === "LONG" ? c.l <= sig.sl : c.h >= sig.sl;
+        const hitTP = dir === "LONG" ? c.h >= sig.tp1 : c.l <= sig.tp1;
+        if (hitSL) { outcome = "loss"; break; }
+        if (hitTP) { outcome = "win"; break; }
       }
+      trades.push({ t: new Date(d1full[i].t).toISOString(), dir, grade: sig.grade, score: sig.score, outcome });
+      nextAllowed[dir] = i + 6; // 6h dedupe, same as live
+      break; // one direction per bar (live picks the best)
     }
-  });
-  await Promise.all(workers);
-  return { scanned: universe.length, emitted, errors };
+  }
+  return {
+    engine: "confluence", asset: symbol, days,
+    ...summarizeTrades(trades, "Replay with funding=0 and OI neutral (no history); no slippage/fees — upper bound."),
+  };
+}
+
+// Gold Asian Range Breakout replay, day by day (mirrors the live detector,
+// minus the live-only freshness gate). Graded on the day's 5m candles.
+async function backtestArb(env, days) {
+  const sym = LIVE_SYMBOLS.XAUUSD;
+  const c5 = await fetchCandles(env, sym.td, "5min", Math.min(5000, days * 288 + 100));
+  const c15 = await fetchCandles(env, sym.td, "15min", Math.min(5000, days * 96 + 100));
+  const dates = [...new Set(c5.map((c) => c.t.slice(0, 10)))];
+  const trades = [];
+
+  for (const date of dates) {
+    const noon = new Date(date + "T12:00:00Z");
+    if (noon.getUTCDay() === 1) continue; // Mondays skipped, per strategy
+    const ctx = dayContext(c5.filter((c) => c.t <= date + " 12:00:00"), noon);
+    if (!ctx.asian || ctx.asian.width < 8 || ctx.asian.width > 35) continue;
+    const dayC15 = c15.filter((c) => c.t.startsWith(date) && new Date(c.t.replace(" ", "T") + "Z").getUTCHours() >= 7);
+    const brk = dayC15.find((c) => c.c > ctx.asian.high || c.c < ctx.asian.low);
+    if (!brk) continue;
+    const dir = brk.c > ctx.asian.high ? "LONG" : "SHORT";
+    const entry = brk.c;
+    const sl = dir === "LONG" ? ctx.asian.low : ctx.asian.high;
+    const tp = dir === "LONG" ? entry + 1.5 * ctx.asian.width : entry - 1.5 * ctx.asian.width;
+    const brkMs = new Date(brk.t.replace(" ", "T") + "Z").getTime();
+    let outcome = "breakeven";
+    for (const c of c5) {
+      const tMs = new Date(c.t.replace(" ", "T") + "Z").getTime();
+      if (tMs <= brkMs) continue;
+      if (!c.t.startsWith(date) || new Date(c.t.replace(" ", "T") + "Z").getUTCHours() >= 16) break; // close-all 16:00
+      const hitSL = dir === "LONG" ? c.l <= sl : c.h >= sl;
+      const hitTP = dir === "LONG" ? c.h >= tp : c.l <= tp;
+      if (hitSL) { outcome = "loss"; break; }
+      if (hitTP) { outcome = "win"; break; }
+    }
+    trades.push({ t: date, dir, grade: "A", score: null, outcome });
+  }
+  return {
+    engine: "asian_range_breakout", asset: sym.td, days,
+    ...summarizeTrades(trades, "Replay; no slippage/spread — upper bound. Strategy close-all at 16:00 UTC honored."),
+  };
+}
+
+// EUR/USD Overlap Momentum replay, day by day. Graded to 20:00 UTC hard exit.
+async function backtestOm(env, days) {
+  const sym = LIVE_SYMBOLS.EURUSD;
+  const c5 = await fetchCandles(env, sym.td, "5min", Math.min(5000, days * 288 + 100));
+  const dates = [...new Set(c5.map((c) => c.t.slice(0, 10)))];
+  const trades = [];
+
+  for (const date of dates) {
+    const noon = new Date(date + "T12:00:00Z");
+    if (noon.getUTCDay() === 5 && noon.getUTCDate() <= 7) continue; // NFP
+    const hour1 = c5.filter((c) => c.t.startsWith(date) && new Date(c.t.replace(" ", "T") + "Z").getUTCHours() === 12);
+    if (hour1.length < 10) continue;
+    const open = hour1[0].o, close = hour1[hour1.length - 1].c;
+    const high = Math.max(...hour1.map((c) => c.h)), low = Math.min(...hour1.map((c) => c.l));
+    const body = close - open, width = high - low;
+    if (Math.abs(body) < 0.0015 || width < 0.0008 || width > 0.0060) continue;
+    const dir = body > 0 ? "LONG" : "SHORT";
+    const buf = 0.0002;
+    const sl = dir === "LONG" ? low - buf : high + buf;
+    const tp = dir === "LONG" ? close + 1.5 * width : close - 1.5 * width;
+    const entryMs = new Date(date + "T13:00:00Z").getTime();
+    let outcome = "breakeven";
+    for (const c of c5) {
+      const tMs = new Date(c.t.replace(" ", "T") + "Z").getTime();
+      if (tMs <= entryMs) continue;
+      if (!c.t.startsWith(date) || new Date(c.t.replace(" ", "T") + "Z").getUTCHours() >= 20) break; // hard exit 20:00
+      const hitSL = dir === "LONG" ? c.l <= sl : c.h >= sl;
+      const hitTP = dir === "LONG" ? c.h >= tp : c.l <= tp;
+      if (hitSL) { outcome = "loss"; break; }
+      if (hitTP) { outcome = "win"; break; }
+    }
+    trades.push({ t: date, dir, grade: "A", score: null, outcome });
+  }
+  return {
+    engine: "overlap_momentum", asset: sym.td, days,
+    ...summarizeTrades(trades, "Replay; no slippage/spread — upper bound. Hard exit 20:00 UTC honored."),
+  };
+}
+
+// Daily 21:05 UTC digest: today's flow, grades, and running engine scoreboard.
+async function dailyDigest(env) {
+  if (!env.DB) return;
+  const today = new Date().toISOString().slice(0, 10);
+  const [sig, graded, engines] = await Promise.all([
+    env.DB.prepare(
+      `SELECT direction, COUNT(*) AS n FROM signals WHERE mode='live' AND created_at >= ? GROUP BY direction`
+    ).bind(today + " 00:00:00").all(),
+    env.DB.prepare(
+      `SELECT outcome, COUNT(*) AS n FROM signals WHERE mode='live' AND outcome_noted_at >= ? GROUP BY outcome`
+    ).bind(today + " 00:00:00").all(),
+    env.DB.prepare(
+      `SELECT setup_type, SUM(CASE WHEN outcome='win' THEN 1 ELSE 0 END) AS w,
+              SUM(CASE WHEN outcome='loss' THEN 1 ELSE 0 END) AS l
+       FROM signals WHERE mode='live' AND outcome IN ('win','loss') GROUP BY setup_type ORDER BY (w+l) DESC`
+    ).all(),
+  ]);
+  const count = (rows, key) => rows.results.find((r) => r.direction === key || r.outcome === key)?.n || 0;
+  const lines = [
+    `📊 <b>ChartSage daily — ${today}</b>`,
+    `Signals today: ${sig.results.reduce((a, r) => a + r.n, 0)} ` +
+      `(${count(sig.results, "LONG")} LONG · ${count(sig.results, "SHORT")} SHORT · ${count(sig.results, "NO_TRADE")} NO_TRADE)`,
+    `Graded today: ✅ ${count(graded.results, "win")} · ❌ ${count(graded.results, "loss")} · ➖ ${count(graded.results, "breakeven")}`,
+  ];
+  if (engines.results.length) {
+    lines.push("All-time by engine:");
+    for (const e of engines.results) {
+      const n = e.w + e.l;
+      lines.push(`• ${(e.setup_type || "?").replace(/_/g, " ")}: ${e.w}/${n} (${Math.round((100 * e.w) / n)}%)`);
+    }
+  } else {
+    lines.push("No graded outcomes yet — engines warming up.");
+  }
+  const tmr = newsGuard(new Date(Date.now() + 86400e3));
+  if (tmr.today) lines.push(`⚠️ Tomorrow: ${tmr.today} — blackout windows apply`);
+  await notifyTelegram(env, lines.join("\n"));
 }
 
 // Telegram channel notifications — fire-and-forget, never breaks a request.
@@ -959,7 +1167,7 @@ async function runLiveAnalysis(env, symKey) {
     },
     { jsonMode: true }
   );
-  finalizeSignal(signal);
+  finalizeSignal(signal, { edge: await getEdge(env) });
 
   // 3. Trade plan computed server-side from ATR (model never invents levels)
   const plan = buildTradePlan(signal.direction, c5[c5.length - 1].c, atr5, sym.decimals);
@@ -985,7 +1193,9 @@ async function fetchGradingCandles(env, asset) {
 }
 
 // Walk 1m candles since entry: first TP touch = win, first SL touch = loss
-// (if both inside one candle, count it a loss — conservative).
+// (if both inside one candle, count it a loss — conservative). While walking,
+// record max favorable/adverse excursion in R-multiples — this is what tells
+// us whether SL/TP geometry is right, not just whether the call was right.
 async function gradeOpenSignals(env) {
   if (!env.DB) return;
   const { results: open } = await env.DB.prepare(
@@ -996,25 +1206,32 @@ async function gradeOpenSignals(env) {
   const now = Date.now();
   for (const s of open) {
     const entryMs = new Date(s.created_at.replace(" ", "T") + "Z").getTime();
-    if (now - entryMs > 4 * 3600e3) {
-      await env.DB.prepare(`UPDATE signals SET outcome='breakeven', outcome_noted_at=datetime('now') WHERE id=?`)
-        .bind(s.id).run();
-      await notifyTelegram(env, gradeMessage(s, "breakeven"));
-      continue;
-    }
+    const timedOut = now - entryMs > 4 * 3600e3;
     try {
       const candles = await fetchGradingCandles(env, s.asset);
+      const risk = Math.abs(s.entry_price - s.sl);
+      let mfe = 0, mae = 0, resolved = null;
       for (const c of candles) {
         if (c.tMs <= entryMs) continue;
+        const fav = s.direction === "LONG" ? c.h - s.entry_price : s.entry_price - c.l;
+        const adv = s.direction === "LONG" ? s.entry_price - c.l : c.h - s.entry_price;
+        if (fav > mfe) mfe = fav;
+        if (adv > mae) mae = adv;
         const hitSL = s.direction === "LONG" ? c.l <= s.sl : c.h >= s.sl;
         const hitTP = s.direction === "LONG" ? c.h >= s.tp : c.l <= s.tp;
         if (hitSL || hitTP) {
-          const outcome = hitSL ? "loss" : "win";
-          await env.DB.prepare(`UPDATE signals SET outcome=?, outcome_noted_at=datetime('now') WHERE id=?`)
-            .bind(outcome, s.id).run();
-          await notifyTelegram(env, gradeMessage(s, outcome));
+          resolved = hitSL ? "loss" : "win";
           break;
         }
+      }
+      if (!resolved && timedOut) resolved = "breakeven";
+      if (resolved) {
+        const mfe_r = risk > 0 ? Math.round((mfe / risk) * 1000) / 1000 : null;
+        const mae_r = risk > 0 ? Math.round((mae / risk) * 1000) / 1000 : null;
+        await env.DB.prepare(
+          `UPDATE signals SET outcome=?, outcome_noted_at=datetime('now'), mfe_r=?, mae_r=? WHERE id=?`
+        ).bind(resolved, mfe_r, mae_r, s.id).run();
+        await notifyTelegram(env, gradeMessage(s, resolved));
       }
     } catch (e) {
       console.error("grading failed for #" + s.id + " " + s.asset + ": " + (e.message || e));
@@ -1197,6 +1414,7 @@ async function analyze(env, imageBase64, notes) {
   finalizeSignal(signal, {
     forceNoTradeReason: force,
     capConfidence: assetClass === "unknown" ? 60 : 100,
+    edge: await getEdge(env),
   });
 
   // 5. Entry timing computed server-side from the chart timeframe
@@ -1210,13 +1428,13 @@ async function analyze(env, imageBase64, notes) {
 }
 
 // Shared probability->direction derivation. Direction is DERIVED from the
-// lean, never model-chosen. 60% threshold clears the ~55.6% breakeven at
-// 80% payout with margin for estimation error.
-function finalizeSignal(signal, { forceNoTradeReason = "", capConfidence = 100 } = {}) {
+// lean, never model-chosen. The edge threshold clears the ~55.6% breakeven
+// at 80% payout with margin — and is auto-tuned by the calibration loop
+// once enough graded outcomes exist (see calibrate()).
+function finalizeSignal(signal, { forceNoTradeReason = "", capConfidence = 100, edge = 60 } = {}) {
   const probUp = Math.max(0, Math.min(100, Number(signal.prob_up) || 50));
   signal.prob_up = probUp;
-  const EDGE = 60;
-  signal.direction = probUp >= EDGE ? "LONG" : probUp <= 100 - EDGE ? "SHORT" : "NO_TRADE";
+  signal.direction = probUp >= edge ? "LONG" : probUp <= 100 - edge ? "SHORT" : "NO_TRADE";
   // Confidence = strength of the lean (50 = coin flip, 100 = maximal conviction).
   signal.confidence = Math.min(capConfidence, Math.round(Math.max(probUp, 100 - probUp)));
   if (forceNoTradeReason) {
@@ -1225,6 +1443,66 @@ function finalizeSignal(signal, { forceNoTradeReason = "", capConfidence = 100 }
   }
   signal.expiry_minutes = Math.max(1, Math.min(15, Number(signal.expiry_minutes) || 1));
   return signal;
+}
+
+// The calibration loop's tunable: current edge threshold (default 60).
+async function getEdge(env) {
+  if (!env.DB) return 60;
+  try {
+    const { results } = await env.DB.prepare(`SELECT value FROM settings WHERE key='edge_override'`).all();
+    const v = Number(results[0]?.value);
+    return Number.isFinite(v) && v >= 55 && v <= 75 ? v : 60;
+  } catch {
+    return 60;
+  }
+}
+
+// Nightly calibration: bucket predicted lean vs realized outcomes, then
+// retune the edge — but conservatively, and only on real data volume.
+async function calibrate(env, payout = 80) {
+  if (!env.DB) return;
+  const breakeven = 100 / (1 + payout / 100);
+  const { results: rows } = await env.DB.prepare(
+    `SELECT confidence, SUM(CASE WHEN outcome='win' THEN 1 ELSE 0 END) AS w,
+            SUM(CASE WHEN outcome='loss' THEN 1 ELSE 0 END) AS l
+     FROM signals
+     WHERE mode='live' AND direction != 'NO_TRADE' AND outcome IN ('win','loss') AND confidence IS NOT NULL
+     GROUP BY confidence`
+  ).all();
+
+  // Realized win rate per lean bucket (always fresh in /stats too)
+  const buckets = { "50-59": [0, 0], "60-69": [0, 0], "70-79": [0, 0], "80+": [0, 0] };
+  let total = 0;
+  for (const r of rows) {
+    const b = r.confidence < 60 ? "50-59" : r.confidence < 70 ? "60-69" : r.confidence < 80 ? "70-79" : "80+";
+    buckets[b][0] += r.w;
+    buckets[b][1] += r.l;
+    total += r.w + r.l;
+  }
+
+  // Pick the lowest edge whose realized WR clears breakeven + 5 margin on n >= 20.
+  let recommended = null;
+  for (const edge of [55, 60, 65, 70]) {
+    const n = rows.filter((r) => r.confidence >= edge).reduce((a, r) => a + r.w + r.l, 0);
+    const w = rows.filter((r) => r.confidence >= edge).reduce((a, r) => a + r.w, 0);
+    if (n >= 20 && (100 * w) / n >= breakeven + 5) {
+      recommended = edge;
+      break;
+    }
+  }
+
+  const current = await getEdge(env);
+  if (recommended !== null && recommended !== current && total >= 50) {
+    await env.DB.prepare(
+      `INSERT INTO settings (key, value) VALUES ('edge_override', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`
+    ).bind(String(recommended)).run();
+    await notifyTelegram(
+      env,
+      `🧠 <b>Calibration update</b> — edge threshold ${current} → ${recommended} ` +
+      `(n=${total} graded; realized WR clears breakeven at this lean).`
+    );
+  }
+  return { buckets, recommended, total };
 }
 
 /* ------------------------------------------------------------------ */
@@ -1237,7 +1515,7 @@ const json = (obj, status = 200) =>
     headers: { "Content-Type": "application/json" },
   });
 
-const PROTECTED_PATHS = new Set(["/analyze", "/analyze-live", "/analyze-crypto", "/outcome", "/signals", "/stats"]);
+const PROTECTED_PATHS = new Set(["/analyze", "/analyze-live", "/analyze-crypto", "/backtest", "/outcome", "/signals", "/stats"]);
 
 export default {
   async fetch(request, env, ctx) {
@@ -1318,6 +1596,26 @@ export default {
         return json(result);
       }
 
+      if (url.pathname === "/backtest" && request.method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        const engine = String(body.engine || "");
+        const days = Math.min(30, Math.max(3, Number(body.days) || 14));
+        if (engine === "confluence") {
+          const symbol = String(body.symbol || "BTCUSDT").toUpperCase();
+          if (!/^[A-Z0-9]{2,20}USDT$/.test(symbol)) return json({ error: "symbol must look like BTCUSDT" }, 400);
+          return json(await backtestConfluence(symbol, days));
+        }
+        if (engine === "arb") {
+          if (!env.TWELVE_DATA_KEY) return json({ error: "TWELVE_DATA_KEY not configured" }, 503);
+          return json(await backtestArb(env, Math.min(days, 17))); // 5m fetch depth cap
+        }
+        if (engine === "om") {
+          if (!env.TWELVE_DATA_KEY) return json({ error: "TWELVE_DATA_KEY not configured" }, 503);
+          return json(await backtestOm(env, Math.min(days, 17)));
+        }
+        return json({ error: "engine must be one of: confluence | arb | om" }, 400);
+      }
+
       if (url.pathname === "/outcome" && request.method === "POST") {
         const { id, outcome } = await request.json();
         if (!id || !["win", "loss", "breakeven", "skipped"].includes(outcome))
@@ -1354,12 +1652,32 @@ export default {
              GROUP BY ${groupCol} ORDER BY signals DESC`
           ).all();
         const confBucket = `CASE WHEN confidence < 60 THEN '<60' WHEN confidence < 75 THEN '60-74' ELSE '75+' END`;
-        const [byClass, bySession, bySetup, byConfidence] = await Promise.all([
+        const [byClass, bySession, bySetup, byConfidence, excursion] = await Promise.all([
           q("asset_class"),
           q("session"),
           q("setup_type"),
           q(confBucket),
+          // Geometry diagnostics: are stops/targets placed well per strategy?
+          env.DB.prepare(
+            `SELECT setup_type AS bucket,
+                    COUNT(*) AS resolved,
+                    ROUND(AVG(CASE WHEN outcome='loss' THEN mfe_r END), 2) AS avg_mfe_before_loss,
+                    ROUND(AVG(CASE WHEN outcome='win' THEN mae_r END), 2) AS avg_mae_before_win,
+                    ROUND(AVG(CASE WHEN outcome='win' THEN mfe_r END), 2) AS avg_mfe_win
+             FROM signals
+             WHERE mode='live' AND outcome IN ('win','loss') AND mfe_r IS NOT NULL
+             GROUP BY setup_type`
+          ).all(),
         ]);
+        const calibration = await env.DB.prepare(
+          `SELECT CASE WHEN confidence < 60 THEN '50-59' WHEN confidence < 70 THEN '60-69'
+                       WHEN confidence < 80 THEN '70-79' ELSE '80+' END AS bucket,
+                  COUNT(*) AS n,
+                  SUM(CASE WHEN outcome='win' THEN 1 ELSE 0 END) AS w
+           FROM signals
+           WHERE mode='live' AND direction != 'NO_TRADE' AND outcome IN ('win','loss')
+           GROUP BY bucket ORDER BY bucket`
+        ).all();
 
         // Wilson 95% interval — honest uncertainty at small sample sizes.
         const wilson = (w, n, z = 1.96) => {
@@ -1393,6 +1711,16 @@ export default {
           by_session: rate(bySession),
           by_setup: rate(bySetup),
           by_confidence: rate(byConfidence),
+          // Geometry read: high avg_mfe_before_loss = TP too far; high
+          // avg_mae_before_win = SL too wide. >=10 resolved to mean anything.
+          excursion: excursion.results,
+          // Calibration: realized win rate per predicted-lean bucket.
+          calibration: calibration.results.map((r) => ({
+            bucket: r.bucket,
+            resolved: r.n,
+            realized_win_rate: r.n ? Math.round((1000 * r.w) / r.n) / 10 : null,
+          })),
+          edge: await getEdge(env),
         });
       }
 
@@ -1424,6 +1752,24 @@ export default {
             await cryptoScan(env, { notify: true });
           } catch (e) {
             console.error("crypto scan failed: " + (e.message || e));
+          }
+        }
+
+        // Daily digest at 21:05 UTC
+        if (h === 21 && m >= 5 && m < 10) {
+          try {
+            await dailyDigest(env);
+          } catch (e) {
+            console.error("digest failed: " + (e.message || e));
+          }
+        }
+
+        // Nightly calibration at 22:05 UTC: retune the edge from graded data
+        if (h === 22 && m >= 5 && m < 10) {
+          try {
+            await calibrate(env);
+          } catch (e) {
+            console.error("calibration failed: " + (e.message || e));
           }
         }
 
@@ -1666,6 +2012,12 @@ async function loadStats(){
     block("Setup", s.by_setup) + block("Confidence", s.by_confidence);
   $("#stats-note").textContent = "Breakeven at " + s.payout_pct + "% payout = " + s.breakeven_win_rate +
     "% win rate. ▲ = 95% CI clears breakeven. Dimmed rows have < " + s.min_sample + " resolved outcomes — noise, not signal.";
+  if (s.excursion && s.excursion.length) {
+    $("#stats-note").textContent += " Geometry (R): " + s.excursion.map((e) =>
+      (e.bucket || "?").replace(/_/g, " ") + " — MFE→loss " + (e.avg_mfe_before_loss ?? "—") +
+      ", MAE→win " + (e.avg_mae_before_win ?? "—")
+    ).join(" · ") + ". High MFE→loss = TP too far; high MAE→win = SL too wide.";
+  }
 }
 
 loadLog(); loadStats();

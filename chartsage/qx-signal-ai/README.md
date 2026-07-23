@@ -73,7 +73,15 @@ wrangler deploy
 - Live trade levels computed from ATR(14) — the model never invents prices
 - NO_TRADE enforced when chart readability < 50 or trend is choppy
 - Unknown assets capped at confidence 60 and flagged `low_context`
-- Auto-grader: TP-first = win, SL-first = loss, both-in-one-candle = loss, 4h = breakeven
+- Auto-grader: TP-first = win, SL-first = loss, both-in-one-candle = loss, 4h = breakeven;
+  records MFE/MAE excursion in R per trade (geometry diagnostics in /stats)
+- Correlation guard: BTC/ETH are drivers — same-direction alts suppressed when a
+  driver fires; concurrent same-direction crypto capped at 3
+- Self-calibration: nightly 22:05 UTC job compares predicted lean vs realized win
+  rates; retunes the edge threshold (settings.edge_override) once n>=50 graded
+- /backtest replays deterministic engines over historical candles (upper bound:
+  no slippage/fees; crypto replay uses funding=0/OI neutral)
+- Daily digest to Telegram at 21:05 UTC (flow, grades, engine scoreboard)
 - Telegram: live LONG/SHORT signals and their graded outcomes post to your channel
   (NO_TRADE stays silent; notification failures never block analysis)
 - Entry timing for screenshots computed server-side (never model-generated)
