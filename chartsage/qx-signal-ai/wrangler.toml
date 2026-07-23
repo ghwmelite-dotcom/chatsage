@@ -6,6 +6,14 @@ account_id = "ea2eb3a9813660dfca2a60e594858538"
 [ai]
 binding = "AI"
 
+[[durable_objects.bindings]]
+name = "PRICE_WATCHER"
+class_name = "PriceWatcher"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["PriceWatcher"]
+
 [triggers]
 # Auto-grades open live signals by walking real 1m candles (TP/SL first-touch)
 crons = ["*/5 * * * *"]

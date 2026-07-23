@@ -73,8 +73,10 @@ wrangler deploy
 - Live trade levels computed from ATR(14) — the model never invents prices
 - NO_TRADE enforced when chart readability < 50 or trend is choppy
 - Unknown assets capped at confidence 60 and flagged `low_context`
-- Auto-grader: TP-first = win, SL-first = loss, both-in-one-candle = loss, 4h = breakeven;
-  records MFE/MAE excursion in R per trade (geometry diagnostics in /stats)
+- Auto-grader: dual-path — PriceWatcher Durable Object streams Bybit tickers over
+  WebSocket and resolves crypto TP/SL tick-by-tick (tick-level MFE/MAE); the 5-min
+  cron candle-walk grades gold/EUR and backstops crypto. TP-first win, SL-first loss,
+  both-in-candle = loss, 4h = breakeven; mfe_r/mae_r surface in /stats.excursion
 - Correlation guard: BTC/ETH are drivers — same-direction alts suppressed when a
   driver fires; concurrent same-direction crypto capped at 3
 - Self-calibration: nightly 22:05 UTC job compares predicted lean vs realized win

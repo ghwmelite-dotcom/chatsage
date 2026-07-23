@@ -923,6 +923,7 @@ async function cryptoScan(env, { symbol = null, notify = true } = {}) {
     openCount[sig.direction]++;
     if (notify && sig.grade === "A") await notifySignal(env, cryptoSignalMessage(sig));
   }
+  if (emitted.length) await refreshPriceWatcher(env); // DO starts watching instantly
   return { scanned: universe.length, emitted, errors, suppressed };
 }
 
@@ -1590,6 +1591,130 @@ async function calibrate(env, payout = 80) {
 }
 
 /* ------------------------------------------------------------------ */
+/* PriceWatcher Durable Object — real-time crypto grading.              */
+/* Holds a WebSocket to Bybit's linear ticker stream and resolves TP/SL */
+/* on the tick that touches them. The cron candle-walk remains as the   */
+/* backstop (and the only grader for gold/EUR — Bybit is crypto-only).  */
+/* Cost note: an always-on DO ≈ 330k GB-s/month, within the free 400k.  */
+/* ------------------------------------------------------------------ */
+
+export class PriceWatcher {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+    this.ws = null;
+    this.signals = new Map(); // symbol -> Map(id -> tracked signal)
+  }
+
+  async fetch() {
+    await this.refresh();
+    return new Response("ok");
+  }
+
+  async refresh() {
+    const { results } = await this.env.DB.prepare(
+      `SELECT id, asset, direction, entry_price, sl, tp FROM signals
+       WHERE mode='live' AND asset_class='crypto' AND outcome IS NULL
+         AND direction != 'NO_TRADE' AND sl IS NOT NULL`
+    ).all();
+    const next = new Map();
+    for (const s of results) {
+      if (!next.has(s.asset)) next.set(s.asset, new Map());
+      const prev = this.signals.get(s.asset)?.get(s.id);
+      next.get(s.asset).set(s.id, {
+        ...s,
+        mfe: prev?.mfe || 0,
+        mae: prev?.mae || 0,
+        risk: Math.abs(s.entry_price - s.sl),
+      });
+    }
+    this.signals = next;
+    this.ensureSocket();
+    if (!(await this.state.storage.getAlarm())) {
+      await this.state.storage.setAlarm(Date.now() + 20000);
+    }
+  }
+
+  ensureSocket() {
+    if (this.ws && this.ws.readyState === 1) return;
+    try { this.ws?.close(); } catch { /* already dead */ }
+    const ws = new WebSocket("wss://stream.bybit.com/v5/public/linear");
+    this.ws = ws;
+    ws.addEventListener("open", () => {
+      const symbols = [...this.signals.keys()];
+      if (symbols.length) {
+        ws.send(JSON.stringify({ op: "subscribe", args: symbols.map((s) => `tickers.${s}`) }));
+      }
+    });
+    ws.addEventListener("message", (ev) => this.onMessage(ev.data));
+    const drop = () => { if (this.ws === ws) this.ws = null; };
+    ws.addEventListener("close", drop);
+    ws.addEventListener("error", drop);
+  }
+
+  async onMessage(raw) {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+    const topic = msg.topic || "";
+    if (!topic.startsWith("tickers.")) return;
+    const sym = topic.slice(8);
+    const price = parseFloat(msg.data?.lastPrice);
+    if (!Number.isFinite(price)) return;
+    const group = this.signals.get(sym);
+    if (!group) return;
+    for (const [id, s] of group) {
+      const fav = s.direction === "LONG" ? price - s.entry_price : s.entry_price - price;
+      if (fav > s.mfe) s.mfe = fav;
+      if (-fav > s.mae) s.mae = -fav;
+      const hitSL = s.direction === "LONG" ? price <= s.sl : price >= s.sl;
+      const hitTP = s.direction === "LONG" ? price >= s.tp : price <= s.tp;
+      if (hitSL || hitTP) {
+        await this.resolve(sym, id, s, hitSL ? "loss" : "win");
+      }
+    }
+  }
+
+  async resolve(sym, id, s, outcome) {
+    this.signals.get(sym)?.delete(id);
+    if (this.signals.get(sym)?.size === 0) this.signals.delete(sym);
+    const mfe_r = s.risk > 0 ? Math.round((s.mfe / s.risk) * 1000) / 1000 : null;
+    const mae_r = s.risk > 0 ? Math.round((s.mae / s.risk) * 1000) / 1000 : null;
+    // outcome IS NULL guard: if the cron walk got there first, stay silent
+    const r = await this.env.DB.prepare(
+      `UPDATE signals SET outcome=?, outcome_noted_at=datetime('now'), mfe_r=?, mae_r=?
+       WHERE id=? AND outcome IS NULL`
+    ).bind(outcome, mfe_r, mae_r, id).run();
+    if (r.meta.changes > 0) {
+      await notifyTelegram(this.env, gradeMessage(s, outcome));
+      await updateGovernor(this.env);
+    }
+  }
+
+  async alarm() {
+    try {
+      if (this.ws && this.ws.readyState === 1) {
+        this.ws.send(JSON.stringify({ op: "ping" }));
+      }
+      await this.refresh();
+    } catch (e) {
+      console.error("PriceWatcher alarm: " + (e.message || e));
+      this.ws = null; // force reconnect next refresh
+    } finally {
+      this.state.storage.setAlarm(Date.now() + 20000);
+    }
+  }
+}
+
+async function refreshPriceWatcher(env) {
+  if (!env.PRICE_WATCHER) return;
+  try {
+    await env.PRICE_WATCHER.get(env.PRICE_WATCHER.idFromName("global")).fetch("https://do/refresh");
+  } catch (e) {
+    console.error("price watcher refresh: " + (e.message || e));
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* HTTP handlers                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -1826,6 +1951,7 @@ export default {
     ctx.waitUntil(
       (async () => {
         await gradeOpenSignals(env);
+        await refreshPriceWatcher(env); // keep the real-time grader in sync
 
         const t = new Date(event.scheduledTime || Date.now());
         const h = t.getUTCHours(), m = t.getUTCMinutes();

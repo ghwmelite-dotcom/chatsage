@@ -39,8 +39,11 @@ the screenshot endpoint `/analyze` remains for API use but has no UI. OTC reject
 ## Architecture invariants (do not break)
 - Direction is DERIVED server-side from prob_up (>=60 LONG, <=40 SHORT, else NO_TRADE)
 - Trade levels computed from ATR(14) on 5m: SL 1.5x, TP 3x (1:2 R:R) — model never sets prices
-- Auto-grader: walks real 1m candles; TP-first win, SL-first loss, both-in-candle = loss, 4h = breakeven;
-  records mfe_r/mae_r (R-multiples) per trade — geometry diagnostics surface in /stats.excursion
+- Auto-grader: DUAL-PATH — PriceWatcher DO (PRICE_WATCHER binding, wss Bybit linear,
+  alarm every 20s ≈330k GB-s/mo vs 400k free) resolves crypto TP/SL on tick;
+  5-min cron candle-walk grades gold/EUR + backstops crypto (outcome IS NULL guards
+  prevent double-grading). TP-first win, SL-first loss, both-in-candle = loss,
+  4h = breakeven; mfe_r/mae_r in /stats.excursion
 - Correlation guard: BTCUSDT/ETHUSDT are drivers; same-direction alts suppressed when a
   driver fires; concurrent same-direction crypto capped at 3
 - Calibration loop: nightly 22:05 UTC — realized WR per lean bucket (/stats.calibration);
