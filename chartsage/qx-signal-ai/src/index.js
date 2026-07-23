@@ -938,7 +938,7 @@ const HTML = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ChartSage — screenshot in, signal out</title>
+<title>ChartSage — live feed in, signal out</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
@@ -959,13 +959,7 @@ header p{color:var(--dim);font-size:13px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
 .card .body{padding:18px}
 .kente{height:5px;background:var(--kente)}
-.drop{border:2px dashed var(--line);border-radius:8px;padding:34px 16px;text-align:center;color:var(--dim);cursor:pointer;transition:border-color .15s}
-.drop:hover,.drop.over{border-color:var(--gold);color:var(--text)}
-.drop img{max-width:100%;max-height:280px;border-radius:6px}
-textarea{width:100%;margin-top:12px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;color:var(--text);padding:10px;font-family:inherit;font-size:14px;resize:vertical;min-height:44px}
 button{font-family:inherit;font-weight:500;border:none;border-radius:6px;cursor:pointer;font-size:14px}
-.primary{width:100%;margin-top:12px;padding:13px;background:var(--gold);color:#141414;font-weight:700;font-size:15px}
-.primary:disabled{background:var(--flat);color:#222;cursor:wait}
 .liverow{display:flex;gap:10px;flex-wrap:wrap}
 .live{flex:1;min-width:180px;padding:12px;background:var(--panel2);border:1px solid var(--line);color:var(--text);font-weight:600}
 .live:hover{border-color:var(--gold)}
@@ -979,10 +973,6 @@ button{font-family:inherit;font-weight:500;border:none;border-radius:6px;cursor:
 .cell .k{font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--dim)}
 .cell .v{font-size:14px;margin-top:4px}
 .reason{padding:14px 18px;font-size:13.5px;line-height:1.55;color:#c4cdd8;border-top:1px solid var(--line)}
-.outcome{display:flex;gap:8px;padding:12px 18px;border-top:1px solid var(--line);flex-wrap:wrap;align-items:center}
-.outcome span{font-size:12px;color:var(--dim);margin-right:4px}
-.outcome button{padding:7px 14px;background:var(--panel2);border:1px solid var(--line);color:var(--text)}
-.outcome button:hover{border-color:var(--gold)}
 .err{color:var(--short);font-size:13px;padding:8px 0;white-space:pre-wrap}
 table{width:100%;border-collapse:collapse;font-size:12.5px}
 th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
@@ -997,7 +987,7 @@ h2{font-size:14px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);p
 <body>
 <header>
   <h1>Chart<span>Sage</span></h1>
-  <p class="mono">screenshot in · signal out · every call logged</p>
+  <p class="mono">live feed in · signal out · every call graded</p>
 </header>
 
 <div class="wrap">
@@ -1005,17 +995,8 @@ h2{font-size:14px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);p
     <div class="liverow">
       <button class="live" data-sym="XAUUSD">Gold (XAU/USD) — live analysis</button>
       <button class="live" data-sym="EURUSD">EUR/USD — live analysis</button>
-      <button class="live" data-sym="XAGUSD">Silver (XAG/USD) — live analysis</button>
     </div>
     <div class="err" id="live-err"></div>
-  </div></div>
-
-  <div class="card"><div class="kente"></div><div class="body">
-    <div class="drop" id="drop">Paste (Ctrl+V), drop, or click to upload a chart screenshot</div>
-    <input type="file" id="file" accept="image/*" hidden>
-    <textarea id="notes" placeholder="Optional notes for the analyst (e.g. 'news just dropped', 'third touch of this level')"></textarea>
-    <button class="primary" id="go" disabled>Analyze chart</button>
-    <div class="err" id="err"></div>
   </div></div>
 
   <div id="result"></div>
@@ -1033,9 +1014,7 @@ h2{font-size:14px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);p
 </div>
 
 <script>
-let imgB64 = null, lastId = null;
 const $ = (s) => document.querySelector(s);
-const drop = $("#drop"), go = $("#go"), err = $("#err");
 
 // API key stored locally; prompted for on first 401.
 let apiKey = localStorage.getItem("cs_key") || "";
@@ -1051,109 +1030,7 @@ async function api(path, opts = {}) {
   return res;
 }
 
-// Downscale to max 1280px JPEG — full-res screenshots are multi-MB payloads
-// that slow the vision call and burn neurons for zero readability gain.
-function setImage(file){
-  const r = new FileReader();
-  r.onload = () => {
-    const im = new Image();
-    im.onload = () => {
-      const MAX = 1280;
-      const scale = Math.min(1, MAX / Math.max(im.width, im.height));
-      const c = document.createElement("canvas");
-      c.width = Math.round(im.width * scale);
-      c.height = Math.round(im.height * scale);
-      c.getContext("2d").drawImage(im, 0, 0, c.width, c.height);
-      const url = c.toDataURL("image/jpeg", 0.85);
-      imgB64 = url.split(",")[1];
-      drop.innerHTML = "";
-      const prev = new Image(); prev.src = url; drop.appendChild(prev);
-      go.disabled = false; err.textContent = "";
-    };
-    im.src = r.result;
-  };
-  r.readAsDataURL(file);
-}
-drop.onclick = () => $("#file").click();
-$("#file").onchange = (e) => e.target.files[0] && setImage(e.target.files[0]);
-drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("over"); };
-drop.ondragleave = () => drop.classList.remove("over");
-drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove("over"); e.dataTransfer.files[0] && setImage(e.dataTransfer.files[0]); };
-window.addEventListener("paste", (e) => {
-  for (const it of e.clipboardData.items) if (it.type.startsWith("image/")) setImage(it.getAsFile());
-});
-
-go.onclick = async () => {
-  go.disabled = true; go.textContent = "Reading chart…"; err.textContent = "";
-  try {
-    const res = await api("/analyze", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image: imgB64, notes: $("#notes").value })
-    });
-    const d = await res.json();
-    if (d.error) throw new Error(d.error);
-    lastId = d.id;
-    render(d);
-    if (d.direction !== "NO_TRADE") startCountdown(d.expiry_minutes);
-    loadLog(); loadStats();
-  } catch (ex) { err.textContent = ex.message; }
-  go.disabled = false; go.textContent = "Analyze chart";
-};
-
-let cdTimer = null;
-function startCountdown(mins){
-  clearInterval(cdTimer);
-  let left = Math.max(1, Number(mins) || 1) * 60;
-  cdTimer = setInterval(() => {
-    const node = $("#cd");
-    if (!node) return clearInterval(cdTimer);
-    left--;
-    if (left <= 0) {
-      node.textContent = "expired — log the result below";
-      node.style.color = "var(--gold)";
-      return clearInterval(cdTimer);
-    }
-    node.textContent = Math.floor(left / 60) + ":" + String(left % 60).padStart(2, "0");
-  }, 1000);
-}
-
-function render(d){
-  const dirWord = d.direction === "LONG" ? "▲ LONG (CALL)" : d.direction === "SHORT" ? "▼ SHORT (PUT)" : "— NO TRADE";
-  $("#result").innerHTML = \`
-  <div class="card"><div class="kente"></div>
-    <div class="sig-head">
-      <div class="dir \${d.direction}">\${dirWord}</div>
-      <div class="conf mono">P(up) \${d.prob_up}% · lean \${d.confidence}/100</div>
-    </div>
-    <div class="grid">
-      <div class="cell"><div class="k">Asset</div><div class="v">\${d.asset || "unknown"}</div></div>
-      <div class="cell"><div class="k">Class / Session</div><div class="v">\${d.asset_class} · \${d.session}</div></div>
-      <div class="cell"><div class="k">Setup</div><div class="v">\${d.setup_type || "—"}</div></div>
-      <div class="cell"><div class="k">Entry</div><div class="v mono">\${d.entry_timing || "—"}</div></div>
-      <div class="cell"><div class="k">Expiry</div><div class="v mono">\${d.expiry_minutes} min</div></div>
-      \${d.direction !== "NO_TRADE" ? \`<div class="cell"><div class="k">Expires in</div><div class="v mono" id="cd">\${d.expiry_minutes}:00</div></div>\` : ""}
-      <div class="cell"><div class="k">Chart TF</div><div class="v mono">\${d.chart_read?.timeframe || "?"}</div></div>
-    </div>
-    <div class="reason">\${d.reasoning || ""}</div>
-    \${d.direction !== "NO_TRADE" ? \`
-    <div class="outcome"><span>Log the result:</span>
-      <button onclick="mark('win')">Win</button>
-      <button onclick="mark('loss')">Loss</button>
-      <button onclick="mark('breakeven')">Breakeven</button>
-      <button onclick="mark('skipped')">Skipped</button>
-    </div>\` : ""}
-  </div>\`;
-}
-
-async function mark(outcome){
-  if (!lastId) return;
-  await api("/outcome", { method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({ id: lastId, outcome }) });
-  loadLog(); loadStats();
-}
-
-// Live metals analysis — no screenshot, the worker pulls real candles.
+// Live analysis — the worker pulls real candles, no upload needed.
 document.querySelectorAll(".live").forEach((btn) => (btn.onclick = async () => {
   const liveErr = $("#live-err");
   const label = btn.textContent;

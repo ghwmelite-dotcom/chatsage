@@ -12,9 +12,9 @@ Signal analyst for real markets on Cloudflare Workers (free tier). Two modes:
   00:00–07:00 range, SL opposite end, TP 1.5× width) and EUR/USD Overlap Momentum
   (first 12:00–13:00 hour sets direction, SL beyond the hour's range, TP 1.5× width).
   One engine signal per asset per day, tagged with its own `setup_type` in `/stats`.
-- **Screenshot (fallback)** — paste a chart screenshot; a vision pass reads it, a
-  per-asset-class rulebook estimates `prob_up`. OTC pairs are **rejected** — they are
-  broker-generated feeds with no public tape.
+- **Screenshot (API-only legacy)** — `POST /analyze` still works for real-feed chart
+  screenshots, but the upload UI was removed; the landing page is live-analysis only.
+  OTC pairs are **rejected** — they are broker-generated feeds with no public tape.
 
 Direction is always derived server-side from the probability lean (≥60 LONG, ≤40 SHORT,
 else NO_TRADE). Every signal and outcome is logged to D1 so the win rates judge the

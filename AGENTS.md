@@ -4,8 +4,8 @@
 Signal analyst for real markets (XAU/USD + EUR/USD live; XAG/USD disabled — paywalled
 on Twelve Data free tier) on Cloudflare Workers.
 Live feed → probability estimate → server-computed ATR trade plan → auto-graded outcomes
-→ Telegram channel alerts. Screenshot/vision mode exists as a fallback for real-feed
-charts; OTC pairs are rejected by design (broker-generated, no public tape).
+→ Telegram channel alerts. Landing page is live-analysis only (Gold + EUR/USD buttons);
+the screenshot endpoint `/analyze` remains for API use but has no UI. OTC rejected by design.
 
 ## Strategy engines (deterministic, LLM-free, `setup_type` separates them in /stats)
 - `asian_range_breakout` (XAU/USD, 07:00–12:00 UTC): first fresh 15m body close beyond
