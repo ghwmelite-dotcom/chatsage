@@ -55,6 +55,8 @@ the screenshot endpoint `/analyze` remains for API use but has no UI. OTC reject
   (mode='shadow', parent_id, same entry/SL, TP 1R + 2.5R, setup_type suffix
   ':tp1r'/':tp25r'); graders include shadows but only live rows notify/govern;
   /stats.arena = per-variant expectancy in R
+- /ask: natural-language Q&A over the D1 ledger (buildDataPack + 70B, grounded,
+  no invented figures)
 - /backtest: replays deterministic engines (confluence needs symbol; arb/om capped at 17d
   by Twelve Data fetch depth); replay is an upper bound (no slippage/fees, funding=0)
 - Daily digest 21:05 UTC to Telegram

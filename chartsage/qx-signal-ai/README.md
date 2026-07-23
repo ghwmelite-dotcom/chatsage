@@ -62,6 +62,10 @@ wrangler deploy
   (prob_up, direction, entry_price, sl, tp) from the live feed.
   XAGUSD needs a paid Twelve Data plan; XAUUSD + EURUSD auto-analyze every 30 min (07–21 UTC)
 - `POST /analyze` — `{ image: base64, notes?: string }` → signal JSON (rejects OTC)
+- `POST /analyze-crypto` — `{ symbol?: "BTCUSDT" }` → top-15 confluence scan (or single coin)
+- `POST /backtest` — `{ engine: confluence|arb|om, symbol?, days? }` → replay stats (upper bound)
+- `POST /ask` — `{ question }` → 70B analyst answers from your own logged data only;
+  refuses to overclaim when n is small
 - `POST /outcome` — `{ id, outcome: win|loss|breakeven|skipped }` (screenshot mode; live signals self-grade)
 - `GET /signals?limit=30` — recent log
 - `GET /stats?payout=80` — win rate by asset class / session / setup / confidence bucket,

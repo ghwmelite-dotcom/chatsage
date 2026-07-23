@@ -1744,6 +1744,54 @@ async function refreshPriceWatcher(env) {
   }
 }
 
+// Compact data pack for the /ask analyst — the user's own ledger, no generics.
+async function buildDataPack(env) {
+  const [totals, bySetup, arena, excursion, recent] = await Promise.all([
+    env.DB.prepare(
+      `SELECT COUNT(*) AS signals,
+              SUM(CASE WHEN outcome='win' THEN 1 ELSE 0 END) AS wins,
+              SUM(CASE WHEN outcome='loss' THEN 1 ELSE 0 END) AS losses,
+              SUM(CASE WHEN outcome='breakeven' THEN 1 ELSE 0 END) AS breakevens
+       FROM signals WHERE mode='live' AND direction != 'NO_TRADE'`
+    ).all(),
+    env.DB.prepare(
+      `SELECT asset_class, setup_type,
+              COUNT(*) AS n,
+              SUM(CASE WHEN outcome='win' THEN 1 ELSE 0 END) AS w,
+              SUM(CASE WHEN outcome='loss' THEN 1 ELSE 0 END) AS l
+       FROM signals WHERE mode='live' AND outcome IN ('win','loss')
+       GROUP BY asset_class, setup_type ORDER BY n DESC LIMIT 12`
+    ).all(),
+    env.DB.prepare(
+      `SELECT SUBSTR(setup_type, INSTR(setup_type, ':') + 1) AS variant,
+              COUNT(*) AS n,
+              SUM(CASE WHEN outcome='win' THEN 1 ELSE 0 END) AS w,
+              SUM(CASE WHEN outcome='loss' THEN 1 ELSE 0 END) AS l
+       FROM signals WHERE mode='shadow' AND outcome IN ('win','loss') GROUP BY variant`
+    ).all(),
+    env.DB.prepare(
+      `SELECT setup_type, ROUND(AVG(CASE WHEN outcome='loss' THEN mfe_r END), 2) AS mfe_loss,
+              ROUND(AVG(CASE WHEN outcome='win' THEN mae_r END), 2) AS mae_win
+       FROM signals WHERE mode='live' AND outcome IN ('win','loss') AND mfe_r IS NOT NULL
+       GROUP BY setup_type`
+    ).all(),
+    env.DB.prepare(
+      `SELECT id, created_at, asset, setup_type, direction, confidence, outcome
+       FROM signals WHERE mode='live' ORDER BY id DESC LIMIT 8`
+    ).all(),
+  ]);
+  return {
+    totals: totals.results[0],
+    win_loss_by_class_setup: bySetup.results,
+    arena_variants: arena.results,
+    excursion_r: excursion.results,
+    governor: await governorState(env),
+    edge_threshold: await getEdge(env),
+    recent_signals: recent.results,
+    note: "win rates need n>=30 to mean anything; R multiples: win=+RR, loss=-1R",
+  };
+}
+
 /* ------------------------------------------------------------------ */
 /* HTTP handlers                                                       */
 /* ------------------------------------------------------------------ */
@@ -1754,7 +1802,7 @@ const json = (obj, status = 200) =>
     headers: { "Content-Type": "application/json" },
   });
 
-const PROTECTED_PATHS = new Set(["/analyze", "/analyze-live", "/analyze-crypto", "/backtest", "/outcome", "/signals", "/stats"]);
+const PROTECTED_PATHS = new Set(["/analyze", "/analyze-live", "/analyze-crypto", "/backtest", "/ask", "/outcome", "/signals", "/stats"]);
 
 export default {
   async fetch(request, env, ctx) {
@@ -1853,6 +1901,28 @@ export default {
           return json(await backtestOm(env, Math.min(days, 17)));
         }
         return json({ error: "engine must be one of: confluence | arb | om" }, 400);
+      }
+
+      if (url.pathname === "/ask" && request.method === "POST") {
+        const { question } = await request.json().catch(() => ({}));
+        if (!question || typeof question !== "string")
+          return json({ error: "Missing 'question' (string)" }, 400);
+        const pack = await buildDataPack(env);
+        const res = await env.AI.run(REASON_MODEL, {
+          messages: [
+            {
+              role: "user",
+              content: `You are ChartSage's trading-data analyst. Answer ONLY from the JSON data below — the user's own logged signals, outcomes, and engine statistics. If the data is insufficient, say so plainly and state what would be needed. Be concise (under 150 words), concrete, and cite the actual numbers. Never invent figures.
+
+DATA:
+${JSON.stringify(pack, null, 1)}
+
+QUESTION: ${question.slice(0, 500)}`,
+            },
+          ],
+          max_tokens: 450,
+        });
+        return json({ answer: res.response || "" });
       }
 
       if (url.pathname === "/outcome" && request.method === "POST") {
