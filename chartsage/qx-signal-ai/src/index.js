@@ -351,7 +351,35 @@ async function persistLiveSignal(env, sym, session, signal, extra = {}, tf = "M5
       signal.entry_price ?? null, signal.sl ?? null, signal.tp ?? null
     )
     .run();
-  return r.meta.last_row_id;
+  const id = r.meta.last_row_id;
+
+  // Strategy arena: every actionable signal spawns shadow variants — same
+  // entry and stop, different TP multiples. Silent (no Telegram), graded by
+  // the same machinery, scored in /stats.arena. The geometry question
+  // ("scalp 1R vs let it run 2.5R") gets answered by evidence.
+  if (signal.direction !== "NO_TRADE" && signal.sl != null && signal.entry_price != null) {
+    const risk = Math.abs(signal.entry_price - signal.sl);
+    const mkShadow = (suffix, rr) => {
+      const tp = signal.direction === "LONG"
+        ? signal.entry_price + rr * risk
+        : signal.entry_price - rr * risk;
+      return env.DB.prepare(
+        `INSERT INTO signals (asset, asset_class, session, chart_timeframe, direction, setup_type,
+          entry_timing, expiry_minutes, prob_up, confidence, reasoning, chart_read, low_context,
+          mode, entry_price, sl, tp, parent_id)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      ).bind(
+        sym.td, sym.class, session, tf,
+        signal.direction, (signal.setup_type || "none") + ":" + suffix,
+        "arena shadow", signal.expiry_minutes || 1,
+        signal.prob_up, signal.confidence, `Arena shadow (${suffix}) of #${id}`,
+        "{}", 0, "shadow",
+        signal.entry_price, signal.sl, tp, id
+      ).run();
+    };
+    await Promise.all([mkShadow("tp1r", 1.0), mkShadow("tp25r", 2.5)]);
+  }
+  return id;
 }
 
 
@@ -1280,8 +1308,8 @@ async function fetchGradingCandles(env, asset) {
 async function gradeOpenSignals(env) {
   if (!env.DB) return;
   const { results: open } = await env.DB.prepare(
-    `SELECT id, asset, direction, entry_price, sl, tp, created_at FROM signals
-     WHERE mode = 'live' AND outcome IS NULL AND direction != 'NO_TRADE' AND sl IS NOT NULL`
+    `SELECT id, asset, direction, entry_price, sl, tp, created_at, mode FROM signals
+     WHERE mode IN ('live','shadow') AND outcome IS NULL AND direction != 'NO_TRADE' AND sl IS NOT NULL`
   ).all();
 
   const now = Date.now();
@@ -1313,7 +1341,7 @@ async function gradeOpenSignals(env) {
         await env.DB.prepare(
           `UPDATE signals SET outcome=?, outcome_noted_at=datetime('now'), mfe_r=?, mae_r=? WHERE id=?`
         ).bind(resolved, mfe_r, mae_r, s.id).run();
-        await notifyTelegram(env, gradeMessage(s, resolved));
+        if (s.mode === "live") await notifyTelegram(env, gradeMessage(s, resolved)); // shadows grade silently
         resolvedAny = true;
       }
     } catch (e) {
@@ -1613,8 +1641,8 @@ export class PriceWatcher {
 
   async refresh() {
     const { results } = await this.env.DB.prepare(
-      `SELECT id, asset, direction, entry_price, sl, tp FROM signals
-       WHERE mode='live' AND asset_class='crypto' AND outcome IS NULL
+      `SELECT id, asset, direction, entry_price, sl, tp, mode FROM signals
+       WHERE mode IN ('live','shadow') AND asset_class='crypto' AND outcome IS NULL
          AND direction != 'NO_TRADE' AND sl IS NOT NULL`
     ).all();
     const next = new Map();
@@ -1685,8 +1713,10 @@ export class PriceWatcher {
        WHERE id=? AND outcome IS NULL`
     ).bind(outcome, mfe_r, mae_r, id).run();
     if (r.meta.changes > 0) {
-      await notifyTelegram(this.env, gradeMessage(s, outcome));
-      await updateGovernor(this.env);
+      if (s.mode === "live") {
+        await notifyTelegram(this.env, gradeMessage(s, outcome));
+        await updateGovernor(this.env);
+      }
     }
   }
 
@@ -1857,11 +1887,20 @@ export default {
                     SUM(CASE WHEN outcome='win' THEN 1 ELSE 0 END) AS wins,
                     SUM(CASE WHEN outcome='loss' THEN 1 ELSE 0 END) AS losses
              FROM signals
-             WHERE direction != 'NO_TRADE'
+             WHERE direction != 'NO_TRADE' AND mode = 'live'
              GROUP BY ${groupCol} ORDER BY signals DESC`
           ).all();
+        const arenaQ = env.DB.prepare(
+          `SELECT SUBSTR(setup_type, INSTR(setup_type, ':') + 1) AS bucket,
+                  COUNT(*) AS signals,
+                  SUM(CASE WHEN outcome='win' THEN 1 ELSE 0 END) AS wins,
+                  SUM(CASE WHEN outcome='loss' THEN 1 ELSE 0 END) AS losses
+           FROM signals
+           WHERE mode = 'shadow' AND direction != 'NO_TRADE'
+           GROUP BY bucket ORDER BY signals DESC`
+        ).all();
         const confBucket = `CASE WHEN confidence < 60 THEN '<60' WHEN confidence < 75 THEN '60-74' ELSE '75+' END`;
-        const [byClass, bySession, bySetup, byConfidence, excursion] = await Promise.all([
+        const [byClass, bySession, bySetup, byConfidence, excursion, arena] = await Promise.all([
           q("asset_class"),
           q("session"),
           q("setup_type"),
@@ -1877,6 +1916,7 @@ export default {
              WHERE mode='live' AND outcome IN ('win','loss') AND mfe_r IS NOT NULL
              GROUP BY setup_type`
           ).all(),
+          arenaQ,
         ]);
         const calibration = await env.DB.prepare(
           `SELECT CASE WHEN confidence < 60 THEN '50-59' WHEN confidence < 70 THEN '60-69'
@@ -1931,6 +1971,14 @@ export default {
           })),
           edge: await getEdge(env),
           governor: await governorState(env),
+          // Arena verdict: which TP multiple wins across all engines (R-adjusted:
+          // tp1r scores 1R per win, tp25r 2.5R — expectancy is what matters).
+          arena: rate(arena).map((r) => ({
+            ...r,
+            expectancy_r: r.wins + r.losses > 0
+              ? Math.round(((r.wins * (r.bucket === "tp25r" ? 2.5 : 1.0) - r.losses) / r.signals) * 100) / 100
+              : null,
+          })),
         });
       }
 

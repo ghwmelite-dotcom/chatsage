@@ -77,6 +77,10 @@ wrangler deploy
   WebSocket and resolves crypto TP/SL tick-by-tick (tick-level MFE/MAE); the 5-min
   cron candle-walk grades gold/EUR and backstops crypto. TP-first win, SL-first loss,
   both-in-candle = loss, 4h = breakeven; mfe_r/mae_r surface in /stats.excursion
+- Strategy arena: every actionable signal spawns two silent shadows (mode='shadow',
+  parent_id → live signal) with the same entry/SL but TP at 1R and 2.5R; graded by
+  the same machinery. /stats.arena scores each variant with expectancy in R — the
+  geometry question gets answered by evidence, not hunches
 - Correlation guard: BTC/ETH are drivers — same-direction alts suppressed when a
   driver fires; concurrent same-direction crypto capped at 3
 - Self-calibration: nightly 22:05 UTC job compares predicted lean vs realized win

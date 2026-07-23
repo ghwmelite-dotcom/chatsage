@@ -51,6 +51,10 @@ the screenshot endpoint `/analyze` remains for API use but has no UI. OTC reject
 - Risk governor: settings.governor_lock — 4 consecutive losses or −5R/7d locks
   signal sends to PAPER (notifySignal wrapper); +3R paper recovery releases;
   tradeR = +rr win / −1 loss / 0 breakeven
+- Strategy arena: persistLiveSignal spawns 2 shadows per actionable signal
+  (mode='shadow', parent_id, same entry/SL, TP 1R + 2.5R, setup_type suffix
+  ':tp1r'/':tp25r'); graders include shadows but only live rows notify/govern;
+  /stats.arena = per-variant expectancy in R
 - /backtest: replays deterministic engines (confluence needs symbol; arb/om capped at 17d
   by Twelve Data fetch depth); replay is an upper bound (no slippage/fees, funding=0)
 - Daily digest 21:05 UTC to Telegram
