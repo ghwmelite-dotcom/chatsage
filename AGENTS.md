@@ -10,7 +10,9 @@ charts; OTC pairs are rejected by design (broker-generated, no public tape).
 - Worker: `chartsage` → https://chartsage.ghwmelite.workers.dev
 - Repo: https://github.com/ghwmelite-dotcom/chatsage (worker code in `chartsage/qx-signal-ai/`)
 - D1: `chartsage-db` (id 18871b09-cd6d-4527-a3f5-cfad12be4908, WEUR)
-- Cron: `*/5 * * * *` — grades open signals; auto-analyzes XAU/USD + EUR/USD at :00/:30, 07–21 UTC
+- Cron: `*/5 * * * *` — grades open signals; mechanical engines every 15 min in their
+  windows (XAU Asian Range Breakout 07–12, EUR/USD Overlap Momentum 12–16);
+  probabilistic auto-analysis at :00/:30, 07–21 UTC
   (XAG/USD disabled: paywalled on Twelve Data free tier)
 - Telegram channel: "XAU-XAG Signals" (@xau_xag_signals)
 
@@ -24,6 +26,8 @@ charts; OTC pairs are rejected by design (broker-generated, no public tape).
 - Trade levels computed from ATR(14) on 5m: SL 1.5x, TP 3x (1:2 R:R) — model never sets prices
 - Auto-grader: walks real 1m candles; TP-first win, SL-first loss, both-in-candle = loss, 4h = breakeven
 - One open trade per asset; NO_TRADE never notifies Telegram
+- marketOpen(): Sun 21:00–Fri 21:00 UTC only; newsGuard(): ±45 min blackout around
+  FOMC/CPI/NFP (NEWS_UTC list in code — H2 CPI dates approximate, verify at bls.gov)
 - llama-3.2-11b-vision takes `prompt` + `image` (byte array), NOT chat messages
 - Notifications are fire-and-forget (ctx.waitUntil); failures must not affect analysis
 - Stats: payout-adjusted breakeven, Wilson 95% CI, min-N=30 reliability, calibration buckets

@@ -139,14 +139,27 @@ function summarize(candles, n) {
     .join("\n");
 }
 
-function livePrompt(symbol, session, c5, c15, atr5) {
+function livePrompt(symbol, session, c5, c15, atr5, ctx, newsToday) {
   const rb = RULEBOOKS[symbol.class] || RULEBOOKS.commodity;
   const nowIso = new Date().toISOString().slice(11, 19) + " GMT";
+  const d = symbol.decimals;
+  const levels = ctx
+    ? `
+KEY LEVELS (computed from real candles — treat as ground truth, do not re-derive):
+- Day: ${ctx.dow}
+- Asian range (00:00-07:00 UTC): ${ctx.asian ? `${ctx.asian.low.toFixed(d)} - ${ctx.asian.high.toFixed(d)} (width ${ctx.asian.width.toFixed(d)})` : "not formed yet today"}
+- Current price vs Asian range: ${ctx.posVsAsian}
+- Previous day high / low: ${ctx.pdh != null ? `${ctx.pdh.toFixed(d)} / ${ctx.pdl.toFixed(d)}` : "n/a"}`
+    : "";
+  const news = newsToday
+    ? `\nTIER-1 EVENT TODAY (${newsToday}): expect volatility spikes around the release — demand stronger confluence before any lean away from 50.`
+    : "";
   return `You are a disciplined ${symbol.label} (${symbol.td}) analyst producing a probability estimate for a short-horizon trade plan. You NEVER guess — 50 means coin flip and is a respected answer.
 
 ASSET: ${symbol.label} — live ${symbol.td} feed
 CURRENT SESSION: ${session} | TIME: ${nowIso}
 ATR(14) on 5m: ${atr5.toFixed(symbol.decimals)}
+${levels}${news}
 
 LAST 30 x 5m CANDLES (oldest to newest, [open,high,low,close]):
 ${summarize(c5, 30)}
@@ -178,6 +191,222 @@ function buildTradePlan(direction, entry, atr5, decimals) {
   return direction === "LONG"
     ? { entry_price: r(entry), sl: r(entry - SL_MULT * atr5), tp: r(entry + TP_MULT * atr5) }
     : { entry_price: r(entry), sl: r(entry + SL_MULT * atr5), tp: r(entry - TP_MULT * atr5) };
+}
+
+/* ------------------------------------------------------------------ */
+/* Market hours + Tier-1 news awareness                                */
+/* ------------------------------------------------------------------ */
+
+// Spot FX/metals week: opens Sunday 21:00 UTC, closes Friday 21:00 UTC.
+function marketOpen(now = new Date()) {
+  const d = now.getUTCDay(), h = now.getUTCHours();
+  if (d === 6) return false; // Saturday
+  if (d === 0 && h < 21) return false; // Sunday before open
+  if (d === 5 && h >= 21) return false; // Friday after close
+  return true;
+}
+
+// Tier-1 events (UTC). FOMC statement 14:00 ET, CPI/NFP 08:30 ET.
+// H2 CPI dates are approximate — verify at bls.gov as they publish.
+const NEWS_UTC = [
+  ["FOMC", "2026-07-29 18:00"], ["FOMC", "2026-09-16 18:00"],
+  ["FOMC", "2026-10-28 18:00"], ["FOMC", "2026-12-09 19:00"],
+  ["CPI", "2026-08-12 12:30"], ["CPI", "2026-09-11 12:30"],
+  ["CPI", "2026-10-13 12:30"], ["CPI", "2026-11-10 13:30"], ["CPI", "2026-12-10 13:30"],
+];
+
+// Returns { blackout: event name if within ±45 min (engines stand down),
+//           today: event name if a Tier-1 event lands today (caution context) }.
+function newsGuard(now = new Date()) {
+  const ms = now.getTime();
+  const events = NEWS_UTC.map(([name, s]) => ({ name, t: new Date(s.replace(" ", "T") + ":00Z").getTime() }));
+  // NFP: first Friday of the month, 08:30 ET (use 13:00 UTC center for DST slack)
+  if (now.getUTCDay() === 5 && now.getUTCDate() <= 7) {
+    events.push({ name: "NFP", t: Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 13, 0) });
+  }
+  const todayStr = now.toISOString().slice(0, 10);
+  let today = null;
+  for (const e of events) {
+    if (new Date(e.t).toISOString().slice(0, 10) === todayStr) today = today || e.name;
+    if (Math.abs(ms - e.t) <= 45 * 60e3) return { blackout: e.name, today: today || e.name };
+  }
+  return { blackout: null, today };
+}
+
+/* ------------------------------------------------------------------ */
+/* Layer 1: computed market context (ground truth for prompts)         */
+/* ------------------------------------------------------------------ */
+
+const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+function dayContext(c5, now = new Date()) {
+  const day = (d) => d.toISOString().slice(0, 10);
+  const rows = c5.map((c) => ({ ...c, d: new Date(c.t.replace(" ", "T") + "Z") }));
+  const today = day(now);
+  const asian = rows.filter((r) => day(r.d) === today && r.d.getUTCHours() < 7);
+  // Previous TRADING day (walk back up to 3 days — Monday needs Friday)
+  let pd = [];
+  for (let back = 1; back <= 3 && pd.length < 100; back++) {
+    const ds = day(new Date(now.getTime() - back * 86400e3));
+    pd = rows.filter((r) => day(r.d) === ds);
+  }
+  const last = rows[rows.length - 1];
+  const ctx = { dow: DAYS[now.getUTCDay()], asian: null, pdh: null, pdl: null, posVsAsian: "n/a" };
+  if (asian.length >= 10) {
+    const high = Math.max(...asian.map((r) => r.h));
+    const low = Math.min(...asian.map((r) => r.l));
+    ctx.asian = { high, low, width: high - low };
+    ctx.posVsAsian = last.c > high ? "above" : last.c < low ? "below" : "inside";
+  }
+  if (pd.length >= 100) {
+    ctx.pdh = Math.max(...pd.map((r) => r.h));
+    ctx.pdl = Math.min(...pd.map((r) => r.l));
+  }
+  return ctx;
+}
+
+/* ------------------------------------------------------------------ */
+/* Layer 2: mechanical strategy engines (deterministic, LLM-free)      */
+/* ------------------------------------------------------------------ */
+
+// Gold: Asian Range Breakout — first 15m body close beyond the 00:00-07:00 UTC
+// range, traded 07:00-12:00 UTC. Documented WR 55-65%, PF 1.3-1.6.
+function detectAsianRangeBreakout(ctx, c15, now = new Date()) {
+  const h = now.getUTCHours();
+  if (h < 7 || h >= 12 || !ctx.asian) return null;
+  if (now.getUTCDay() === 1) return null; // Mondays set the weekly range — skip
+  const w = ctx.asian.width;
+  if (w < 8 || w > 35) return null; // <$8 too quiet, >$35 already moved
+  const today = now.toISOString().slice(0, 10);
+  const breaks = c15
+    .map((c) => ({ ...c, d: new Date(c.t.replace(" ", "T") + "Z") }))
+    .filter(
+      (c) =>
+        c.t.startsWith(today) &&
+        c.d.getUTCHours() >= 7 &&
+        (c.c > ctx.asian.high || c.c < ctx.asian.low)
+    );
+  if (!breaks.length) return null;
+  const first = breaks[0];
+  if (now - first.d > 40 * 60e3) return null; // only a fresh first break is tradable
+  const dir = first.c > ctx.asian.high ? "LONG" : "SHORT";
+  return {
+    direction: dir,
+    entry: first.c,
+    sl: dir === "LONG" ? ctx.asian.low : ctx.asian.high, // opposite range end
+    tp: dir === "LONG" ? first.c + 1.5 * w : first.c - 1.5 * w, // 1.5x range width
+    note: `first 15m body close ${dir === "LONG" ? "above" : "below"} Asian range ` +
+      `${ctx.asian.low.toFixed(2)}-${ctx.asian.high.toFixed(2)} (width $${w.toFixed(2)})`,
+  };
+}
+
+// EUR/USD: Overlap Momentum — first overlap hour (12:00-13:00 UTC) sets direction;
+// trade it at 13:00 with SL beyond the hour's range. EUR/USD ranges ~70% of the
+// time; momentum follow-through is only trusted inside the overlap.
+function detectOverlapMomentum(c5, now = new Date()) {
+  const mins = now.getUTCHours() * 60 + now.getUTCMinutes();
+  if (mins < 13 * 60 || mins > 13 * 60 + 35) return null; // signal window 13:00-13:35
+  if (now.getUTCDay() === 5 && now.getUTCDate() <= 7) return null; // NFP first Friday
+  const today = now.toISOString().slice(0, 10);
+  const hour1 = c5
+    .map((c) => ({ ...c, d: new Date(c.t.replace(" ", "T") + "Z") }))
+    .filter((c) => c.t.startsWith(today) && c.d.getUTCHours() === 12);
+  if (hour1.length < 10) return null; // need the full first hour
+  const open = hour1[0].o, close = hour1[hour1.length - 1].c;
+  const high = Math.max(...hour1.map((c) => c.h));
+  const low = Math.min(...hour1.map((c) => c.l));
+  const body = close - open, width = high - low;
+  if (Math.abs(body) < 0.0015) return null; // <15 pip body = doji, no momentum
+  if (width < 0.0008 || width > 0.0060) return null; // no range / already moved
+  const dir = body > 0 ? "LONG" : "SHORT";
+  const buf = 0.0002; // 2-pip buffer beyond the hour's extreme
+  return {
+    direction: dir,
+    entry: close,
+    sl: dir === "LONG" ? low - buf : high + buf,
+    tp: dir === "LONG" ? close + 1.5 * width : close - 1.5 * width,
+    note: `first overlap hour body ${(body * 10000).toFixed(0)} pips ${dir === "LONG" ? "up" : "down"}, ` +
+      `range ${(width * 10000).toFixed(0)} pips`,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Shared persistence                                                  */
+/* ------------------------------------------------------------------ */
+
+async function persistLiveSignal(env, sym, session, signal, extra = {}) {
+  if (!env.DB) return null;
+  const r = await env.DB.prepare(
+    `INSERT INTO signals (asset, asset_class, session, chart_timeframe, direction, setup_type,
+      entry_timing, expiry_minutes, prob_up, confidence, reasoning, chart_read, low_context,
+      mode, entry_price, sl, tp)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  )
+    .bind(
+      sym.td, sym.class, session, "M5",
+      signal.direction, signal.setup_type || "none",
+      signal.entry_timing || "", signal.expiry_minutes || 1,
+      signal.prob_up, signal.confidence, signal.reasoning || "",
+      JSON.stringify(extra), 0, "live",
+      signal.entry_price ?? null, signal.sl ?? null, signal.tp ?? null
+    )
+    .run();
+  return r.meta.last_row_id;
+}
+
+
+// Layer 2 runner: mechanical engines, each in its documented UTC window.
+// Deterministic — no LLM call, geometry straight from the strategy rules.
+async function runEngines(env, now, news) {
+  const today = now.toISOString().slice(0, 10);
+  for (const key of Object.keys(LIVE_SYMBOLS)) {
+    const sym = LIVE_SYMBOLS[key];
+    if (!sym.auto) continue;
+    const h = now.getUTCHours();
+    const isGold = key === "XAUUSD", isEur = key === "EURUSD";
+    if (!((isGold && h >= 7 && h < 12) || (isEur && h >= 12 && h < 16))) continue;
+    // Overlap momentum is untradeable on Tier-1 days — the first hour IS the spike.
+    if (isEur && news.today) continue;
+    const setupType = isGold ? "asian_range_breakout" : "overlap_momentum";
+    try {
+      // One engine signal per asset per day, and never while a trade is open.
+      const { results: dup } = await env.DB.prepare(
+        `SELECT COUNT(*) AS n FROM signals WHERE mode='live' AND asset=? AND setup_type=? AND created_at >= ?`
+      ).bind(sym.td, setupType, today + " 00:00:00").all();
+      if (dup[0].n > 0) continue;
+      const { results: open } = await env.DB.prepare(
+        `SELECT COUNT(*) AS n FROM signals WHERE mode='live' AND asset=? AND outcome IS NULL AND direction != 'NO_TRADE'`
+      ).bind(sym.td).all();
+      if (open[0].n > 0) continue;
+
+      const [c5, c15] = await Promise.all([
+        fetchCandles(env, sym.td, "5min", 600),
+        fetchCandles(env, sym.td, "15min", 96),
+      ]);
+      const ctx = dayContext(c5, now);
+      const det = isGold ? detectAsianRangeBreakout(ctx, c15, now) : detectOverlapMomentum(c5, now);
+      if (!det) continue;
+
+      const session = currentSession(sym.class);
+      const signal = {
+        direction: det.direction,
+        setup_type: setupType,
+        prob_up: det.direction === "LONG" ? 62 : 38, // documented 55-65% WR band
+        confidence: 62,
+        expiry_minutes: 1,
+        entry_timing: "market (live feed)",
+        entry_price: Number(det.entry.toFixed(sym.decimals)),
+        sl: Number(det.sl.toFixed(sym.decimals)),
+        tp: Number(det.tp.toFixed(sym.decimals)),
+        reasoning: `Mechanical ${setupType.replace(/_/g, " ")}: ${det.note}. ` +
+          `SL/TP from range geometry per documented strategy rules.`,
+      };
+      await persistLiveSignal(env, sym, session, signal, { engine: setupType, asian: ctx.asian, pdh: ctx.pdh, pdl: ctx.pdl });
+      await notifyTelegram(env, signalMessage({ asset: sym.td, session, ...signal }));
+    } catch (e) {
+      console.error("engine failed for " + key + ": " + (e.message || e));
+    }
+  }
 }
 
 // Telegram channel notifications — fire-and-forget, never breaks a request.
@@ -216,13 +445,15 @@ function gradeMessage(s, outcome) {
 async function runLiveAnalysis(env, symKey) {
   const sym = LIVE_SYMBOLS[symKey];
 
-  // 1. Real candles: 5m for setup, 15m for higher-timeframe context
+  // 1. Real candles: 5m (~83h so Monday still sees Friday for PDH/PDL), 15m context
   const [c5, c15] = await Promise.all([
-    fetchCandles(env, sym.td, "5min", 60),
+    fetchCandles(env, sym.td, "5min", 1000),
     fetchCandles(env, sym.td, "15min", 30),
   ]);
   const atr5 = atr(c5);
   if (!atr5) throw new Error("Not enough candle history for ATR");
+  const ctx = dayContext(c5);
+  const news = newsGuard();
 
   // 2. Probability estimate from the reasoning model over real numbers
   const session = currentSession(sym.class);
@@ -230,7 +461,7 @@ async function runLiveAnalysis(env, symKey) {
     env,
     REASON_MODEL,
     {
-      messages: [{ role: "user", content: livePrompt(sym, session, c5, c15, atr5) }],
+      messages: [{ role: "user", content: livePrompt(sym, session, c5, c15, atr5, ctx, news.today) }],
       max_tokens: 1000,
     },
     { jsonMode: true }
@@ -241,25 +472,10 @@ async function runLiveAnalysis(env, symKey) {
   const plan = buildTradePlan(signal.direction, c5[c5.length - 1].c, atr5, sym.decimals);
   signal.entry_timing = signal.direction === "NO_TRADE" ? "" : "market (live feed)";
 
-  let id = null;
-  if (env.DB) {
-    const r = await env.DB.prepare(
-      `INSERT INTO signals (asset, asset_class, session, chart_timeframe, direction, setup_type,
-        entry_timing, expiry_minutes, prob_up, confidence, reasoning, chart_read, low_context,
-        mode, entry_price, sl, tp)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
-    )
-      .bind(
-        sym.td, sym.class, session, "M5",
-        signal.direction, signal.setup_type || "none",
-        signal.entry_timing, signal.expiry_minutes,
-        signal.prob_up, signal.confidence, signal.reasoning || "",
-        JSON.stringify({ atr5, last_close: plan.entry_price, candles_5m: c5.length }),
-        0, "live", plan.entry_price, plan.sl, plan.tp
-      )
-      .run();
-    id = r.meta.last_row_id;
-  }
+  const id = await persistLiveSignal(env, sym, session, { ...signal, ...plan }, {
+    atr5, last_close: plan.entry_price, candles_5m: c5.length,
+    asian: ctx.asian, pdh: ctx.pdh, pdl: ctx.pdl,
+  });
 
   return { id, asset: sym.td, asset_class: sym.class, session, ...signal, ...plan };
 }
@@ -573,6 +789,8 @@ export default {
       if (url.pathname === "/analyze-live" && request.method === "POST") {
         if (!env.TWELVE_DATA_KEY)
           return json({ error: "Live feed not configured (TWELVE_DATA_KEY secret missing)" }, 503);
+        if (!marketOpen())
+          return json({ error: "Market is closed (spot FX/metals run Sun 21:00 – Fri 21:00 UTC)" }, 400);
         const { symbol } = await request.json();
         const key = String(symbol || "").toUpperCase();
         if (!LIVE_SYMBOLS[key])
@@ -674,8 +892,8 @@ export default {
     }
   },
 
-  // Cron (every 5 min): auto-grade open live signals by walking real 1m candles.
-  // Every 30 min within 07-21 UTC: auto-analyze both metals (one open trade per asset).
+  // Cron (every 5 min): grade open signals; mechanical engines every 15 min
+  // inside their windows; probabilistic auto-analysis at :00/:30 (07-21 UTC).
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
       (async () => {
@@ -683,8 +901,13 @@ export default {
 
         const t = new Date(event.scheduledTime || Date.now());
         const h = t.getUTCHours(), m = t.getUTCMinutes();
-        if (h < 7 || h >= 21 || m % 30 >= 5) return; // :00 and :30 only, active hours
+        if (!marketOpen(t)) return; // weekend / Friday close — no analysis on stale data
+        if (h < 7 || h >= 21) return;
 
+        const news = newsGuard(t);
+        if (m % 15 < 5 && !news.blackout) await runEngines(env, t, news);
+
+        if (m % 30 >= 5 || news.blackout) return; // probabilistic analysis at :00/:30, never inside a release
         for (const key of Object.keys(LIVE_SYMBOLS)) {
           if (!LIVE_SYMBOLS[key].auto) continue; // e.g. XAG/USD needs a paid Twelve Data plan
           try {

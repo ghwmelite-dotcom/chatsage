@@ -2,10 +2,16 @@
 
 Signal analyst for real markets on Cloudflare Workers (free tier). Two modes:
 
-- **Live metals (primary)** — click Gold or Silver; the Worker pulls real candles from
-  Twelve Data, the 70B model estimates `prob_up` over the numbers, and the server builds
-  a trade plan: entry, SL = 1.5×ATR, TP = 3×ATR (1:2 R:R). Outcomes are **auto-graded**
+- **Live (primary)** — click Gold or EUR/USD; the Worker pulls real candles from
+  Twelve Data, the 70B model estimates `prob_up` over the numbers plus computed levels
+  (Asian range, PDH/PDL, price position), and the server builds a trade plan:
+  entry, SL = 1.5×ATR, TP = 3×ATR (1:2 R:R). Outcomes are **auto-graded**
   by a cron that walks real 1m candles to see whether TP or SL was touched first.
+- **Mechanical engines** — deterministic, LLM-free signals in documented windows:
+  Gold Asian Range Breakout (07:00–12:00 UTC, first 15m body close beyond the
+  00:00–07:00 range, SL opposite end, TP 1.5× width) and EUR/USD Overlap Momentum
+  (first 12:00–13:00 hour sets direction, SL beyond the hour's range, TP 1.5× width).
+  One engine signal per asset per day, tagged with its own `setup_type` in `/stats`.
 - **Screenshot (fallback)** — paste a chart screenshot; a vision pass reads it, a
   per-asset-class rulebook estimates `prob_up`. OTC pairs are **rejected** — they are
   broker-generated feeds with no public tape.
@@ -65,6 +71,12 @@ wrangler deploy
 - Telegram: live LONG/SHORT signals and their graded outcomes post to your channel
   (NO_TRADE stays silent; notification failures never block analysis)
 - Entry timing for screenshots computed server-side (never model-generated)
+- Market-hours guard: no analysis when spot FX/metals are closed
+  (Sat, Sun before 21:00 UTC, Fri after 21:00 UTC) — manual + cron both refuse
+- Tier-1 news guard: FOMC/CPI/NFP calendar in code — engines and probabilistic
+  analysis stand down ±45 min around releases; overlap momentum skips Tier-1 days
+  entirely; same-day events inject a caution note into the prompt
+  (update `NEWS_UTC` in `src/index.js` as new dates publish)
 - Reasoning pass uses JSON mode with retry; truncated JSON salvaged by brace-closing
 - Images downscaled to 1280px JPEG in the browser before upload
 - Per-class rulebooks live in `RULEBOOKS` in `src/index.js` — edit them there
