@@ -17,7 +17,9 @@ system, not vibes.
 ## Stack
 - Workers AI: `@cf/meta/llama-3.2-11b-vision-instruct` (chart reading) + `@cf/meta/llama-3.3-70b-instruct-fp8-fast` (rulebook reasoning)
 - Twelve Data `time_series` API for live XAU/USD + XAG/USD candles
-- D1 for signal + outcome logging; cron trigger (`*/5 * * * *`) for auto-grading
+- D1 for signal + outcome logging; cron trigger (`*/5 * * * *`) for auto-grading,
+  plus auto-analysis of both metals every 30 min within 07:00–21:00 UTC
+  (one open trade per asset; NO_TRADE runs stay silent)
 - Single-file Worker serving the UI
 
 ## Deploy (PowerShell)

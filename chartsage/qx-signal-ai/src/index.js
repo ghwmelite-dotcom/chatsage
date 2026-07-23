@@ -209,6 +209,59 @@ function gradeMessage(s, outcome) {
   return `${icon} <b>${label}</b> — ${s.direction} ${s.asset} @ ${s.entry_price} ${detail}`;
 }
 
+// Shared live-analysis core — used by the /analyze-live endpoint and the
+// auto-analysis cron. Returns the full signal + trade plan object.
+async function runLiveAnalysis(env, symKey) {
+  const sym = LIVE_SYMBOLS[symKey];
+
+  // 1. Real candles: 5m for setup, 15m for higher-timeframe context
+  const [c5, c15] = await Promise.all([
+    fetchCandles(env, sym.td, "5min", 60),
+    fetchCandles(env, sym.td, "15min", 30),
+  ]);
+  const atr5 = atr(c5);
+  if (!atr5) throw new Error("Not enough candle history for ATR");
+
+  // 2. Probability estimate from the reasoning model over real numbers
+  const session = currentSession("commodity");
+  const signal = await runJson(
+    env,
+    REASON_MODEL,
+    {
+      messages: [{ role: "user", content: livePrompt(sym, session, c5, c15, atr5) }],
+      max_tokens: 1000,
+    },
+    { jsonMode: true }
+  );
+  finalizeSignal(signal);
+
+  // 3. Trade plan computed server-side from ATR (model never invents levels)
+  const plan = buildTradePlan(signal.direction, c5[c5.length - 1].c, atr5, sym.decimals);
+  signal.entry_timing = signal.direction === "NO_TRADE" ? "" : "market (live feed)";
+
+  let id = null;
+  if (env.DB) {
+    const r = await env.DB.prepare(
+      `INSERT INTO signals (asset, asset_class, session, chart_timeframe, direction, setup_type,
+        entry_timing, expiry_minutes, prob_up, confidence, reasoning, chart_read, low_context,
+        mode, entry_price, sl, tp)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    )
+      .bind(
+        sym.td, "commodity", session, "M5",
+        signal.direction, signal.setup_type || "none",
+        signal.entry_timing, signal.expiry_minutes,
+        signal.prob_up, signal.confidence, signal.reasoning || "",
+        JSON.stringify({ atr5, last_close: plan.entry_price, candles_5m: c5.length }),
+        0, "live", plan.entry_price, plan.sl, plan.tp
+      )
+      .run();
+    id = r.meta.last_row_id;
+  }
+
+  return { id, asset: sym.td, asset_class: "commodity", session, ...signal, ...plan };
+}
+
 // Walk 1m candles since entry: first TP touch = win, first SL touch = loss
 // (if both inside one candle, count it a loss — conservative).
 async function gradeOpenSignals(env) {
@@ -519,60 +572,16 @@ export default {
         if (!env.TWELVE_DATA_KEY)
           return json({ error: "Live feed not configured (TWELVE_DATA_KEY secret missing)" }, 503);
         const { symbol } = await request.json();
-        const sym = LIVE_SYMBOLS[String(symbol || "").toUpperCase()];
-        if (!sym) return json({ error: "symbol must be one of: " + Object.keys(LIVE_SYMBOLS).join(", ") }, 400);
+        const key = String(symbol || "").toUpperCase();
+        if (!LIVE_SYMBOLS[key])
+          return json({ error: "symbol must be one of: " + Object.keys(LIVE_SYMBOLS).join(", ") }, 400);
 
-        // 1. Real candles: 5m for setup, 15m for higher-timeframe context
-        const [c5, c15] = await Promise.all([
-          fetchCandles(env, sym.td, "5min", 60),
-          fetchCandles(env, sym.td, "15min", 30),
-        ]);
-        const atr5 = atr(c5);
-        if (!atr5) return json({ error: "Not enough candle history for ATR" }, 502);
-
-        // 2. Probability estimate from the reasoning model over real numbers
-        const session = currentSession("commodity");
-        const signal = await runJson(
-          env,
-          REASON_MODEL,
-          {
-            messages: [{ role: "user", content: livePrompt(sym, session, c5, c15, atr5) }],
-            max_tokens: 1000,
-          },
-          { jsonMode: true }
-        );
-        finalizeSignal(signal);
-
-        // 3. Trade plan computed server-side from ATR (model never invents levels)
-        const plan = buildTradePlan(signal.direction, c5[c5.length - 1].c, atr5, sym.decimals);
-        signal.entry_timing = signal.direction === "NO_TRADE" ? "" : "market (live feed)";
-
-        let id = null;
-        if (env.DB) {
-          const r = await env.DB.prepare(
-            `INSERT INTO signals (asset, asset_class, session, chart_timeframe, direction, setup_type,
-              entry_timing, expiry_minutes, prob_up, confidence, reasoning, chart_read, low_context,
-              mode, entry_price, sl, tp)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
-          )
-            .bind(
-              sym.td, "commodity", session, "M5",
-              signal.direction, signal.setup_type || "none",
-              signal.entry_timing, signal.expiry_minutes,
-              signal.prob_up, signal.confidence, signal.reasoning || "",
-              JSON.stringify({ atr5, last_close: plan.entry_price, candles_5m: c5.length }),
-              0, "live", plan.entry_price, plan.sl, plan.tp
-            )
-            .run();
-          id = r.meta.last_row_id;
-        }
+        const result = await runLiveAnalysis(env, key);
 
         // Notify the channel on actionable signals only (NO_TRADE stays silent).
-        if (signal.direction !== "NO_TRADE") {
-          ctx.waitUntil(notifyTelegram(env, signalMessage({ asset: sym.td, session, ...signal, ...plan })));
-        }
+        if (result.direction !== "NO_TRADE") ctx.waitUntil(notifyTelegram(env, signalMessage(result)));
 
-        return json({ id, asset: sym.td, asset_class: "commodity", session, ...signal, ...plan });
+        return json(result);
       }
 
       if (url.pathname === "/outcome" && request.method === "POST") {
@@ -664,8 +673,33 @@ export default {
   },
 
   // Cron (every 5 min): auto-grade open live signals by walking real 1m candles.
+  // Every 30 min within 07-21 UTC: auto-analyze both metals (one open trade per asset).
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(gradeOpenSignals(env));
+    ctx.waitUntil(
+      (async () => {
+        await gradeOpenSignals(env);
+
+        const t = new Date(event.scheduledTime || Date.now());
+        const h = t.getUTCHours(), m = t.getUTCMinutes();
+        if (h < 7 || h >= 21 || m % 30 >= 5) return; // :00 and :30 only, active hours
+
+        for (const key of Object.keys(LIVE_SYMBOLS)) {
+          try {
+            // One open trade per asset — no fresh signal while one is unresolved.
+            const { results } = await env.DB.prepare(
+              `SELECT COUNT(*) AS n FROM signals
+               WHERE mode = 'live' AND asset = ? AND outcome IS NULL AND direction != 'NO_TRADE'`
+            ).bind(LIVE_SYMBOLS[key].td).all();
+            if (results[0].n > 0) continue;
+
+            const r = await runLiveAnalysis(env, key);
+            if (r.direction !== "NO_TRADE") await notifyTelegram(env, signalMessage(r));
+          } catch (e) {
+            console.error("auto-analyze failed for " + key + ": " + (e.message || e));
+          }
+        }
+      })()
+    );
   },
 };
 
