@@ -157,20 +157,21 @@ function extractJson(text) {
   const cleaned = text.replace(/```json|```/g, "").trim();
   const start = cleaned.indexOf("{");
   const end = cleaned.lastIndexOf("}");
-  if (start === -1 || end === -1) throw new Error("No JSON object in model response");
+  if (start === -1 || end === -1)
+    throw new Error("No JSON object in model response: " + cleaned.slice(0, 300));
   return JSON.parse(cleaned.slice(start, end + 1));
 }
 
 // Call a model expecting JSON back; retry once on parse failure.
 // jsonMode uses Workers AI response_format where the model supports it.
-async function runJson(env, model, messages, maxTokens, { jsonMode = false, extra = {} } = {}) {
-  const payload = { messages, max_tokens: maxTokens, ...extra };
+async function runJson(env, model, payload, { jsonMode = false } = {}) {
   if (jsonMode) payload.response_format = { type: "json_object" };
   let lastErr;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const res = await env.AI.run(model, payload);
-      return extractJson(res.response || res.description || "");
+      const raw = res.response ?? res.description ?? "";
+      return extractJson(typeof raw === "string" ? raw : JSON.stringify(raw));
     } catch (err) {
       lastErr = err;
     }
@@ -193,22 +194,14 @@ function nextCandleOpen(timeframe, now = new Date()) {
 }
 
 async function analyze(env, imageBase64, notes) {
-  // 1. Vision pass (llama-3.2-vision has no JSON mode — retry covers parse failures)
+  // 1. Vision pass — this model's schema is prompt + image (no chat messages);
+  //    llama-3.2-vision has no JSON mode, retry covers parse failures.
   const bytes = Uint8Array.from(atob(imageBase64), (c) => c.charCodeAt(0));
-  const chartRead = await runJson(
-    env,
-    VISION_MODEL,
-    [
-      {
-        role: "user",
-        content: [
-          { type: "image", image: [...bytes] },
-          { type: "text", text: VISION_PROMPT },
-        ],
-      },
-    ],
-    700
-  );
+  const chartRead = await runJson(env, VISION_MODEL, {
+    prompt: VISION_PROMPT,
+    image: [...bytes],
+    max_tokens: 700,
+  });
 
   // 2. Classify + session
   const assetClass = classifyAsset(chartRead.asset);
@@ -218,8 +211,10 @@ async function analyze(env, imageBase64, notes) {
   const signal = await runJson(
     env,
     REASON_MODEL,
-    [{ role: "user", content: reasonPrompt(chartRead, assetClass, session, notes) }],
-    600,
+    {
+      messages: [{ role: "user", content: reasonPrompt(chartRead, assetClass, session, notes) }],
+      max_tokens: 600,
+    },
     { jsonMode: true }
   );
 
@@ -372,7 +367,7 @@ export default {
           });
         return json({
           payout_pct: payout,
-          breakeven_win_rate: Math.round(1000 * breakeven) / 10,
+          breakeven_win_rate: Math.round(10 * breakeven) / 10,
           min_sample: MIN_N,
           by_class: rate(byClass),
           by_session: rate(bySession),
