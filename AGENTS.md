@@ -10,7 +10,8 @@ charts; OTC pairs are rejected by design (broker-generated, no public tape).
 - Worker: `chartsage` → https://chartsage.ghwmelite.workers.dev
 - Repo: https://github.com/ghwmelite-dotcom/chatsage (worker code in `chartsage/qx-signal-ai/`)
 - D1: `chartsage-db` (id 18871b09-cd6d-4527-a3f5-cfad12be4908, WEUR)
-- Cron: `*/5 * * * *` — grades open signals; auto-analyzes both metals at :00/:30, 07–21 UTC
+- Cron: `*/5 * * * *` — grades open signals; auto-analyzes XAU/USD + EUR/USD at :00/:30, 07–21 UTC
+  (XAG/USD disabled: paywalled on Twelve Data free tier)
 - Telegram channel: "XAU-XAG Signals" (@xau_xag_signals)
 
 ## Secrets (set via `wrangler secret put`, never in repo)

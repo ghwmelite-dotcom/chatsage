@@ -103,8 +103,10 @@ function classifyAsset(name = "") {
 /* ------------------------------------------------------------------ */
 
 const LIVE_SYMBOLS = {
-  XAUUSD: { td: "XAU/USD", label: "Gold", decimals: 2 },
-  XAGUSD: { td: "XAG/USD", label: "Silver", decimals: 3 },
+  XAUUSD: { td: "XAU/USD", label: "Gold", decimals: 2, auto: true, class: "commodity" },
+  EURUSD: { td: "EUR/USD", label: "Euro / US Dollar", decimals: 5, auto: true, class: "forex" },
+  // XAG/USD needs Twelve Data Grow plan — disabled in the auto-loop until upgraded.
+  XAGUSD: { td: "XAG/USD", label: "Silver", decimals: 3, auto: false, class: "commodity" },
 };
 
 // Returns candles oldest-first: { t, o, h, l, c }
@@ -138,7 +140,7 @@ function summarize(candles, n) {
 }
 
 function livePrompt(symbol, session, c5, c15, atr5) {
-  const rb = RULEBOOKS.commodity;
+  const rb = RULEBOOKS[symbol.class] || RULEBOOKS.commodity;
   const nowIso = new Date().toISOString().slice(11, 19) + " GMT";
   return `You are a disciplined ${symbol.label} (${symbol.td}) analyst producing a probability estimate for a short-horizon trade plan. You NEVER guess — 50 means coin flip and is a respected answer.
 
@@ -223,7 +225,7 @@ async function runLiveAnalysis(env, symKey) {
   if (!atr5) throw new Error("Not enough candle history for ATR");
 
   // 2. Probability estimate from the reasoning model over real numbers
-  const session = currentSession("commodity");
+  const session = currentSession(sym.class);
   const signal = await runJson(
     env,
     REASON_MODEL,
@@ -248,7 +250,7 @@ async function runLiveAnalysis(env, symKey) {
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     )
       .bind(
-        sym.td, "commodity", session, "M5",
+        sym.td, sym.class, session, "M5",
         signal.direction, signal.setup_type || "none",
         signal.entry_timing, signal.expiry_minutes,
         signal.prob_up, signal.confidence, signal.reasoning || "",
@@ -259,7 +261,7 @@ async function runLiveAnalysis(env, symKey) {
     id = r.meta.last_row_id;
   }
 
-  return { id, asset: sym.td, asset_class: "commodity", session, ...signal, ...plan };
+  return { id, asset: sym.td, asset_class: sym.class, session, ...signal, ...plan };
 }
 
 // Walk 1m candles since entry: first TP touch = win, first SL touch = loss
@@ -684,6 +686,7 @@ export default {
         if (h < 7 || h >= 21 || m % 30 >= 5) return; // :00 and :30 only, active hours
 
         for (const key of Object.keys(LIVE_SYMBOLS)) {
+          if (!LIVE_SYMBOLS[key].auto) continue; // e.g. XAG/USD needs a paid Twelve Data plan
           try {
             // One open trade per asset — no fresh signal while one is unresolved.
             const { results } = await env.DB.prepare(
@@ -778,6 +781,7 @@ h2{font-size:14px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);p
   <div class="card"><div class="kente"></div><div class="body">
     <div class="liverow">
       <button class="live" data-sym="XAUUSD">Gold (XAU/USD) — live analysis</button>
+      <button class="live" data-sym="EURUSD">EUR/USD — live analysis</button>
       <button class="live" data-sym="XAGUSD">Silver (XAG/USD) — live analysis</button>
     </div>
     <div class="err" id="live-err"></div>

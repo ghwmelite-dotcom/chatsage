@@ -46,8 +46,9 @@ wrangler deploy
 ```
 
 ## Endpoints (all require `x-api-key`)
-- `POST /analyze-live` — `{ symbol: "XAUUSD"|"XAGUSD" }` → trade plan JSON
-  (prob_up, direction, entry_price, sl, tp) from the live feed
+- `POST /analyze-live` — `{ symbol: "XAUUSD"|"EURUSD"|"XAGUSD" }` → trade plan JSON
+  (prob_up, direction, entry_price, sl, tp) from the live feed.
+  XAGUSD needs a paid Twelve Data plan; XAUUSD + EURUSD auto-analyze every 30 min (07–21 UTC)
 - `POST /analyze` — `{ image: base64, notes?: string }` → signal JSON (rejects OTC)
 - `POST /outcome` — `{ id, outcome: win|loss|breakeven|skipped }` (screenshot mode; live signals self-grade)
 - `GET /signals?limit=30` — recent log
