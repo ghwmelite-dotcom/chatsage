@@ -1,10 +1,10 @@
 # ChartSage — Project Memory
 
 ## What this is
-Signal analyst for real markets (XAU/USD + EUR/USD live; XAG/USD disabled — paywalled
-on Twelve Data free tier) on Cloudflare Workers.
-Live feed → probability estimate → server-computed ATR trade plan → auto-graded outcomes
-→ Telegram channel alerts. Landing page is live-analysis only (Gold + EUR/USD buttons);
+Signal analyst for real markets on Cloudflare Workers: XAU/USD + EUR/USD (Twelve Data)
+and crypto top-15 perps (Binance/Bybit). XAG/USD disabled — paywalled free tier.
+Live feed → probability/deterministic signal → server-computed trade plan → auto-graded
+outcomes → Telegram alerts. Landing page: Gold + EUR/USD + Crypto scan buttons;
 the screenshot endpoint `/analyze` remains for API use but has no UI. OTC rejected by design.
 
 ## Strategy engines (deterministic, LLM-free, `setup_type` separates them in /stats)
@@ -25,11 +25,17 @@ the screenshot endpoint `/analyze` remains for API use but has no UI. OTC reject
 - Worker: `chartsage` → https://chartsage.ghwmelite.workers.dev
 - Repo: https://github.com/ghwmelite-dotcom/chatsage (worker code in `chartsage/qx-signal-ai/`)
 - D1: `chartsage-db` (id 18871b09-cd6d-4527-a3f5-cfad12be4908, WEUR)
-- Cron: `*/5 * * * *` — grades open signals; mechanical engines every 15 min in their
-  windows (XAU Asian Range Breakout 07–12, EUR/USD Overlap Momentum 12–16);
-  probabilistic auto-analysis at :00/:30, 07–21 UTC
-  (XAG/USD disabled: paywalled on Twelve Data free tier)
-- Telegram channel: "XAU-XAG Signals" (@xau_xag_signals)
+- DO: `PriceWatcher` (PRICE_WATCHER binding) — real-time crypto grading via Bybit WS
+- Cron `*/5 * * * *`: grading → crypto scan hourly :00 → digest 21:05 → calibrate 22:05 →
+  market-hours gate → engines every 15 min in windows → probabilistic :00/:30
+- Telegram channel: "XAU-XAG Signals" (@xau_xag_signals) — also carries crypto + digest
+
+## Forward path (agreed sequence, current status)
+1. ✅ Risk governor 2. ✅ Real-time grading 3. ✅ Strategy arena 4. ✅ /ask
+5. ⏸️ EdgeRelay execution link — GATED on proven stats (30+ resolved per slice clearing
+   breakeven). When unblocked: ChartSage becomes a provider in EdgeRelay's
+   signal-ingestion pipeline (repo: C:/dev/Projects/TradeMetrics Pro, branch
+   bias-goldmine-phase-1) so MT5 copier accounts execute A-grade signals with PropGuard.
 
 ## Secrets (set via `wrangler secret put`, never in repo)
 - `API_KEY` — protects all API endpoints (x-api-key header)
