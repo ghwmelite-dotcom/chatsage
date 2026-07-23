@@ -1,10 +1,20 @@
 # ChartSage — Project Memory
 
 ## What this is
-Signal analyst for real markets (primary: XAU/USD + XAG/USD) on Cloudflare Workers.
+Signal analyst for real markets (XAU/USD + EUR/USD live; XAG/USD disabled — paywalled
+on Twelve Data free tier) on Cloudflare Workers.
 Live feed → probability estimate → server-computed ATR trade plan → auto-graded outcomes
 → Telegram channel alerts. Screenshot/vision mode exists as a fallback for real-feed
 charts; OTC pairs are rejected by design (broker-generated, no public tape).
+
+## Strategy engines (deterministic, LLM-free, `setup_type` separates them in /stats)
+- `asian_range_breakout` (XAU/USD, 07:00–12:00 UTC): first fresh 15m body close beyond
+  the 00:00–07:00 range; SL opposite end, TP 1.5× width; skip Mondays, range <$8 or >$35
+- `overlap_momentum` (EUR/USD, 12:00–16:00 UTC): first overlap hour sets direction
+  (≥15-pip body); SL beyond range + 2-pip buffer, TP 1.5× width; skips Tier-1 news days
+- Engines: one signal per asset per day, checked every 15 min in-window
+- Symbols/config live in `LIVE_SYMBOLS` in src/index.js (per-symbol rulebook class,
+  decimals, auto flag)
 
 ## Live deployment
 - Worker: `chartsage` → https://chartsage.ghwmelite.workers.dev
@@ -40,5 +50,6 @@ charts; OTC pairs are rejected by design (broker-generated, no public tape).
 - Deploy: `npx wrangler deploy` from `chartsage/qx-signal-ai/`
 
 ## Cost notes
-- Live analysis ≈ 60 neurons/call; 30-min cadence ≈ 3.4k neurons/day (within 10k free)
-- Twelve Data: ~180 calls/day at current cadence (800/day free tier)
+- Live analysis ≈ 60 neurons/call; ~3.4k neurons/day at current cadence (within 10k free)
+- Twelve Data: ~400 calls/day (probabilistic :00/:30 + engine ticks + grading);
+  800/day free tier — halve engine cadence if quota pressure appears
