@@ -29,15 +29,6 @@ const RULEBOOKS = {
 - During 'overlap' (London/NY), momentum continuation setups are strongest.
 - Avoid trading directly into obvious round-number or marked S/R levels.`,
   },
-  otc: {
-    label: "OTC pair (broker feed)",
-    rules: `Mean-reversion bias. OTC feeds are broker-generated and tend to respect ranges.
-- Valid LONG: price tags a clearly-tested range low / support zone AND prints a rejection wick or engulfing.
-- Valid SHORT: mirror at range high / resistance.
-- Do NOT chase breakouts on OTC — fade extremes only.
-- If the chart shows a strong one-way trend with no pullback structure, prefer NO_TRADE.
-- Session context is irrelevant for OTC.`,
-  },
   crypto: {
     label: "Crypto",
     rules: `Momentum bias, 24/7 market.
@@ -47,12 +38,15 @@ const RULEBOOKS = {
 - If the chart shows chop/compression, NO_TRADE.`,
   },
   commodity: {
-    label: "Commodity (Gold/Oil)",
-    rules: `Session-aware trend bias.
-- Gold: respect London/NY sessions; Asian session gold is usually rangebound — raise NO_TRADE bar.
-- Valid LONG: pullback to prior breakout zone or session low sweep + reclaim.
-- Valid SHORT: mirror. Failed breaks of session highs are high-quality shorts.
-- Never fade a strong impulse leg without a clear rejection structure.`,
+    label: "Metals (Gold/Silver)",
+    rules: `Session-aware trend bias — gold respects the London/NY rhythm.
+- Asian session gold is usually rangebound: raise the NO_TRADE bar; the tradable event is often the London break of the Asian range.
+- Valid LONG: pullback to a prior breakout zone, or a sweep of the Asian/session low that reclaims the level.
+- Valid SHORT: mirror — failed breaks of session highs are high-quality shorts.
+- Previous day high/low (PDH/PDL) are magnets and reversal zones: do not enter directly into them.
+- Never fade a strong impulse leg without a clear rejection structure (long wick, engulfing).
+- Gold strengthens when DXY weakens and real yields fall; if the chart shows DXY-style risk-off panic candles, respect the momentum direction.
+- News windows (NFP, CPI, FOMC) produce violent spikes: stand aside unless the setup formed BEFORE the release.`,
   },
   stock_index: {
     label: "Stock / Index",
@@ -95,7 +89,7 @@ function currentSession(assetClass, now = new Date()) {
 function classifyAsset(name = "") {
   const n = name.toUpperCase();
   if (!n || n === "UNKNOWN") return "unknown";
-  if (n.includes("OTC")) return "otc";
+  if (n.includes("OTC")) return "otc";  // detected only to be rejected — broker-generated, no public tape
   if (/(BTC|ETH|SOL|XRP|DOGE|ADA|BNB|LTC|CRYPTO)/.test(n)) return "crypto";
   if (/(XAU|GOLD|XAG|SILVER|OIL|BRENT|WTI|UKOIL|USOIL|NGAS)/.test(n)) return "commodity";
   if (/(VOLATILITY|CRASH|BOOM|STEP|JUMP|RANGE ?BREAK|VIX ?\d)/.test(n)) return "synthetic";
@@ -105,10 +99,155 @@ function classifyAsset(name = "") {
 }
 
 /* ------------------------------------------------------------------ */
+/* Live market data (Twelve Data) — metals trade plans                 */
+/* ------------------------------------------------------------------ */
+
+const LIVE_SYMBOLS = {
+  XAUUSD: { td: "XAU/USD", label: "Gold", decimals: 2 },
+  XAGUSD: { td: "XAG/USD", label: "Silver", decimals: 3 },
+};
+
+// Returns candles oldest-first: { t, o, h, l, c }
+async function fetchCandles(env, tdSymbol, interval, size) {
+  const url =
+    "https://api.twelvedata.com/time_series?symbol=" + encodeURIComponent(tdSymbol) +
+    "&interval=" + interval + "&outputsize=" + size + "&apikey=" + env.TWELVE_DATA_KEY;
+  const data = await (await fetch(url)).json();
+  if (data.status === "error" || !data.values)
+    throw new Error("Twelve Data: " + (data.message || "no candle data returned"));
+  return data.values
+    .map((v) => ({ t: v.datetime, o: +v.open, h: +v.high, l: +v.low, c: +v.close }))
+    .reverse();
+}
+
+function atr(candles, period = 14) {
+  if (candles.length < period + 1) return null;
+  let sum = 0;
+  for (let i = candles.length - period; i < candles.length; i++) {
+    const c = candles[i], p = candles[i - 1];
+    sum += Math.max(c.h - c.l, Math.abs(c.h - p.c), Math.abs(c.l - p.c));
+  }
+  return sum / period;
+}
+
+function summarize(candles, n) {
+  return candles
+    .slice(-n)
+    .map((c) => `[${c.o},${c.h},${c.l},${c.c}]`)
+    .join("\n");
+}
+
+function livePrompt(symbol, session, c5, c15, atr5) {
+  const rb = RULEBOOKS.commodity;
+  const nowIso = new Date().toISOString().slice(11, 19) + " GMT";
+  return `You are a disciplined ${symbol.label} (${symbol.td}) analyst producing a probability estimate for a short-horizon trade plan. You NEVER guess — 50 means coin flip and is a respected answer.
+
+ASSET: ${symbol.label} — live ${symbol.td} feed
+CURRENT SESSION: ${session} | TIME: ${nowIso}
+ATR(14) on 5m: ${atr5.toFixed(symbol.decimals)}
+
+LAST 30 x 5m CANDLES (oldest to newest, [open,high,low,close]):
+${summarize(c5, 30)}
+
+LAST 16 x 15m CANDLES (higher-timeframe context):
+${summarize(c15, 16)}
+
+RULEBOOK YOU MUST APPLY (no other strategies allowed):
+${rb.rules}
+
+Additional hard rules:
+- prob_up is your honest probability (0-100) that price moves UP over the next 2-4 hours before moving equivalently down. 50 = no edge.
+- A strong lean (>=65 or <=35) requires trend alignment on BOTH timeframes AND a level AND recent confirmation.
+- Respect the session rules in the rulebook — Asian-session chops toward 50 unless the structure is exceptional.
+
+Return ONLY a JSON object, no markdown fences, with exactly these keys:
+{
+ "prob_up": 0-100,
+ "setup_type": "trend_continuation" | "sr_rejection" | "breakout_retest" | "mean_reversion" | "none",
+ "reasoning": "3-5 sentences: which rules fired, what both timeframes agree on, what nearly disqualified it"
+}`;
+}
+
+// Server computes the trade plan from real numbers — the model never invents levels.
+function buildTradePlan(direction, entry, atr5, decimals) {
+  if (direction === "NO_TRADE" || !atr5) return { entry_price: entry, sl: null, tp: null };
+  const SL_MULT = 1.5, TP_MULT = 3.0; // 1:2 risk/reward (skill standard: min 1:1.5, ideal 1:2)
+  const r = (x) => Number(x.toFixed(decimals));
+  return direction === "LONG"
+    ? { entry_price: r(entry), sl: r(entry - SL_MULT * atr5), tp: r(entry + TP_MULT * atr5) }
+    : { entry_price: r(entry), sl: r(entry + SL_MULT * atr5), tp: r(entry - TP_MULT * atr5) };
+}
+
+// Telegram channel notifications — fire-and-forget, never breaks a request.
+async function notifyTelegram(env, text) {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text, parse_mode: "HTML" }),
+    });
+  } catch { /* notification failure must not affect trading logic */ }
+}
+
+function signalMessage(s) {
+  const icon = s.direction === "LONG" ? "🟢" : "🔴";
+  const lines = [
+    `${icon} <b>${s.direction} ${s.asset}</b> @ ${s.entry_price}`,
+    `P(up): ${s.prob_up}% · lean ${s.confidence}/100`,
+    `SL: ${s.sl} · TP: ${s.tp} (1:2 R:R)`,
+    `Setup: ${s.setup_type} · Session: ${s.session}`,
+    `<i>${(s.reasoning || "").slice(0, 400)}</i>`,
+  ];
+  return lines.join("\n");
+}
+
+function gradeMessage(s, outcome) {
+  const icon = outcome === "win" ? "✅" : outcome === "loss" ? "❌" : "➖";
+  const label = outcome.toUpperCase();
+  const detail = outcome === "win" ? `hit TP ${s.tp}` : outcome === "loss" ? `hit SL ${s.sl}` : "time-stopped at 4h";
+  return `${icon} <b>${label}</b> — ${s.direction} ${s.asset} @ ${s.entry_price} ${detail}`;
+}
+
+// Walk 1m candles since entry: first TP touch = win, first SL touch = loss
+// (if both inside one candle, count it a loss — conservative).
+async function gradeOpenSignals(env) {
+  if (!env.TWELVE_DATA_KEY || !env.DB) return;
+  const { results: open } = await env.DB.prepare(
+    `SELECT id, asset, direction, entry_price, sl, tp, created_at FROM signals
+     WHERE mode = 'live' AND outcome IS NULL AND direction != 'NO_TRADE' AND sl IS NOT NULL`
+  ).all();
+
+  const now = Date.now();
+  for (const s of open) {
+    const entryMs = new Date(s.created_at.replace(" ", "T") + "Z").getTime();
+    if (now - entryMs > 4 * 3600e3) {
+      await env.DB.prepare(`UPDATE signals SET outcome='breakeven', outcome_noted_at=datetime('now') WHERE id=?`)
+        .bind(s.id).run();
+      await notifyTelegram(env, gradeMessage(s, "breakeven"));
+      continue;
+    }
+    const candles = await fetchCandles(env, s.asset, "1min", 240);
+    for (const c of candles) {
+      if (new Date(c.t.replace(" ", "T") + "Z").getTime() <= entryMs) continue;
+      const hitSL = s.direction === "LONG" ? c.l <= s.sl : c.h >= s.sl;
+      const hitTP = s.direction === "LONG" ? c.h >= s.tp : c.l <= s.tp;
+      if (hitSL || hitTP) {
+        const outcome = hitSL ? "loss" : "win";
+        await env.DB.prepare(`UPDATE signals SET outcome=?, outcome_noted_at=datetime('now') WHERE id=?`)
+          .bind(outcome, s.id).run();
+        await notifyTelegram(env, gradeMessage(s, outcome));
+        break;
+      }
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* AI pipeline                                                         */
 /* ------------------------------------------------------------------ */
 
-const VISION_PROMPT = `You are a chart-reading engine. Look at this trading-platform screenshot and return ONLY a JSON object, no markdown, no preamble, with exactly these keys:
+const VISION_PROMPT = `Look at this trading-platform screenshot. Your ENTIRE response must be one JSON object: first character { and last character }. No prose, no markdown, no explanation before or after. Exactly these keys:
 {
  "asset": "asset name as shown in the chart header, or 'unknown'",
  "timeframe": "candle timeframe shown, e.g. 'M1', 'M5', or 'unknown'",
@@ -119,6 +258,16 @@ const VISION_PROMPT = `You are a chart-reading engine. Look at this trading-plat
  "price_position": "where current price sits relative to the structure (e.g. 'at range high', 'mid-pullback in uptrend')",
  "readability": 0-100 how clearly the chart could be read
 }`;
+
+// Used when the vision model answers in prose despite the prompt —
+// the reasoning model structures the description instead of failing the request.
+const STRUCTURE_PROMPT = `Convert this trading-chart description into a JSON object with exactly these keys:
+asset (string, 'unknown' if not stated), timeframe (string, 'unknown' if not stated),
+trend (one of: strong_uptrend, uptrend, range, downtrend, strong_downtrend, choppy),
+recent_candles (string), key_levels (string), indicators (string), price_position (string),
+readability (number 0-100, infer from how specific the description is).
+Infer conservatively; never invent an asset name. DESCRIPTION:
+`;
 
 function reasonPrompt(chartRead, assetClass, session, notes) {
   const rb = RULEBOOKS[assetClass] || RULEBOOKS.unknown;
@@ -137,29 +286,52 @@ RULEBOOK YOU MUST APPLY (no other strategies allowed):
 ${rb.rules}
 
 Additional hard rules:
-- If readability < 50, direction MUST be NO_TRADE.
-- If trend is "choppy", direction MUST be NO_TRADE unless a textbook range-extreme rejection is described.
-- Confidence above 75 requires trend alignment AND a level AND a confirmation candle all present in the chart read.
+- prob_up is your honest estimated probability (0-100) that the NEXT candle closes higher than it opens, given the chart read and rulebook. 50 = coin flip. Do not inflate it.
+- If readability < 50 or trend is "choppy", set prob_up near 50 (no edge claimed).
+- A strong lean (prob_up >= 65 or <= 35) requires trend alignment AND a level AND a confirmation candle all present in the chart read.
 - expiry_minutes: 1 for M1 momentum entries, 2-3 for range-extreme fades, 5 for M5 charts.
 
 Return ONLY a JSON object, no markdown fences, with exactly these keys:
 {
- "direction": "LONG" | "SHORT" | "NO_TRADE",
+ "prob_up": 0-100,
  "setup_type": "trend_continuation" | "sr_rejection" | "breakout_retest" | "mean_reversion" | "none",
  "expiry_minutes": number,
- "confidence": 0-100,
- "reasoning": "3-5 sentences: which rules fired, which nearly disqualified it"
+ "reasoning": "3-5 sentences: which rules fired, what the probability lean is, which nearly disqualified it"
 }`;
 }
 
 function extractJson(text) {
   if (!text) throw new Error("Empty model response");
-  const cleaned = text.replace(/```json|```/g, "").trim();
+  const cleaned = String(text).replace(/```json|```/g, "").trim();
   const start = cleaned.indexOf("{");
-  const end = cleaned.lastIndexOf("}");
-  if (start === -1 || end === -1)
+  if (start === -1)
     throw new Error("No JSON object in model response: " + cleaned.slice(0, 300));
-  return JSON.parse(cleaned.slice(start, end + 1));
+  // Take the first balanced {...} object — models sometimes append a second
+  // object or trailing commentary; first-{ to last-} slicing breaks on those.
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < cleaned.length; i++) {
+    const ch = cleaned[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return JSON.parse(cleaned.slice(start, i + 1));
+    }
+  }
+  // Model hit max_tokens mid-object: salvage by closing the open string/braces.
+  const remainder = cleaned.slice(start);
+  for (const suffix of ['"}', '"}}', "}", "}}", '"}]}', "]}"]) {
+    try {
+      return JSON.parse(remainder + suffix);
+    } catch { /* try next */ }
+  }
+  throw new Error("Unbalanced JSON in model response: " + cleaned.slice(0, 300));
 }
 
 // Call a model expecting JSON back; retry once on parse failure.
@@ -194,14 +366,33 @@ function nextCandleOpen(timeframe, now = new Date()) {
 }
 
 async function analyze(env, imageBase64, notes) {
-  // 1. Vision pass — this model's schema is prompt + image (no chat messages);
-  //    llama-3.2-vision has no JSON mode, retry covers parse failures.
+  // 1. Vision pass — this model's schema is prompt + image (no chat messages).
+  //    Low temperature keeps it terse; if it still answers in prose, the
+  //    reasoning model structures the description as a fallback.
   const bytes = Uint8Array.from(atob(imageBase64), (c) => c.charCodeAt(0));
-  const chartRead = await runJson(env, VISION_MODEL, {
+  const visionRes = await env.AI.run(VISION_MODEL, {
     prompt: VISION_PROMPT,
     image: [...bytes],
     max_tokens: 700,
+    temperature: 0.2,
   });
+  const visionRaw = visionRes.response ?? visionRes.description ?? "";
+  const visionText = typeof visionRaw === "string" ? visionRaw : JSON.stringify(visionRaw);
+
+  let chartRead;
+  try {
+    chartRead = extractJson(visionText);
+  } catch {
+    chartRead = await runJson(
+      env,
+      REASON_MODEL,
+      {
+        messages: [{ role: "user", content: STRUCTURE_PROMPT + visionText.slice(0, 3000) }],
+        max_tokens: 800,
+      },
+      { jsonMode: true }
+    );
+  }
 
   // 2. Classify + session
   const assetClass = classifyAsset(chartRead.asset);
@@ -213,21 +404,21 @@ async function analyze(env, imageBase64, notes) {
     REASON_MODEL,
     {
       messages: [{ role: "user", content: reasonPrompt(chartRead, assetClass, session, notes) }],
-      max_tokens: 600,
+      max_tokens: 1000,
     },
     { jsonMode: true }
   );
 
   // 4. Hard server-side guards (never trust the model alone)
   const readability = Number(chartRead.readability) || 0;
-  if (readability < 50) {
-    signal.direction = "NO_TRADE";
-    signal.reasoning = `Chart readability ${readability}/100 — below threshold. ` + (signal.reasoning || "");
-  }
-  if (assetClass === "unknown") signal.confidence = Math.min(Number(signal.confidence) || 0, 60);
-  if (!["LONG", "SHORT", "NO_TRADE"].includes(signal.direction)) signal.direction = "NO_TRADE";
-  signal.confidence = Math.max(0, Math.min(100, Number(signal.confidence) || 0));
-  signal.expiry_minutes = Math.max(1, Math.min(15, Number(signal.expiry_minutes) || 1));
+  let force = "";
+  if (readability < 50) force = `Chart readability ${readability}/100 — below threshold. `;
+  else if (chartRead.trend === "choppy" && Math.abs((Number(signal.prob_up) || 50) - 50) > 10)
+    force = "Choppy trend — probability lean clamped to no-edge. ";
+  finalizeSignal(signal, {
+    forceNoTradeReason: force,
+    capConfidence: assetClass === "unknown" ? 60 : 100,
+  });
 
   // 5. Entry timing computed server-side from the chart timeframe
   const tf = /^[MH]\d+$/i.test(chartRead.timeframe || "") ? chartRead.timeframe.toUpperCase() : "M1";
@@ -237,6 +428,24 @@ async function analyze(env, imageBase64, notes) {
     signal.direction === "NO_TRADE" ? "" : `open of next ${tf} candle (${hhmmss} GMT)`;
 
   return { chartRead, assetClass, session, signal };
+}
+
+// Shared probability->direction derivation. Direction is DERIVED from the
+// lean, never model-chosen. 60% threshold clears the ~55.6% breakeven at
+// 80% payout with margin for estimation error.
+function finalizeSignal(signal, { forceNoTradeReason = "", capConfidence = 100 } = {}) {
+  const probUp = Math.max(0, Math.min(100, Number(signal.prob_up) || 50));
+  signal.prob_up = probUp;
+  const EDGE = 60;
+  signal.direction = probUp >= EDGE ? "LONG" : probUp <= 100 - EDGE ? "SHORT" : "NO_TRADE";
+  // Confidence = strength of the lean (50 = coin flip, 100 = maximal conviction).
+  signal.confidence = Math.min(capConfidence, Math.round(Math.max(probUp, 100 - probUp)));
+  if (forceNoTradeReason) {
+    signal.direction = "NO_TRADE";
+    signal.reasoning = forceNoTradeReason + (signal.reasoning || "");
+  }
+  signal.expiry_minutes = Math.max(1, Math.min(15, Number(signal.expiry_minutes) || 1));
+  return signal;
 }
 
 /* ------------------------------------------------------------------ */
@@ -249,10 +458,10 @@ const json = (obj, status = 200) =>
     headers: { "Content-Type": "application/json" },
   });
 
-const PROTECTED_PATHS = new Set(["/analyze", "/outcome", "/signals", "/stats"]);
+const PROTECTED_PATHS = new Set(["/analyze", "/analyze-live", "/outcome", "/signals", "/stats"]);
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     // Shared-secret guard (set with: wrangler secret put API_KEY).
@@ -270,12 +479,19 @@ export default {
 
         const { chartRead, assetClass, session, signal } = await analyze(env, body.image, body.notes || "");
 
+        // OTC feeds are broker-generated with no public tape — refuse them.
+        if (assetClass === "otc")
+          return json({
+            error: "OTC pairs are broker-generated, not a market — ChartSage doesn't analyze them. " +
+              "Use a real-feed chart (gold, forex, crypto) or the live Gold/Silver analyzer.",
+          }, 400);
+
         let id = null;
         if (env.DB) {
           const r = await env.DB.prepare(
             `INSERT INTO signals (asset, asset_class, session, chart_timeframe, direction, setup_type,
-              entry_timing, expiry_minutes, confidence, reasoning, chart_read, low_context)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
+              entry_timing, expiry_minutes, prob_up, confidence, reasoning, chart_read, low_context)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
           )
             .bind(
               chartRead.asset || "unknown",
@@ -286,6 +502,7 @@ export default {
               signal.setup_type || "none",
               signal.entry_timing || "",
               signal.expiry_minutes,
+              signal.prob_up,
               signal.confidence,
               signal.reasoning || "",
               JSON.stringify(chartRead),
@@ -296,6 +513,66 @@ export default {
         }
 
         return json({ id, asset: chartRead.asset, asset_class: assetClass, session, chart_read: chartRead, ...signal });
+      }
+
+      if (url.pathname === "/analyze-live" && request.method === "POST") {
+        if (!env.TWELVE_DATA_KEY)
+          return json({ error: "Live feed not configured (TWELVE_DATA_KEY secret missing)" }, 503);
+        const { symbol } = await request.json();
+        const sym = LIVE_SYMBOLS[String(symbol || "").toUpperCase()];
+        if (!sym) return json({ error: "symbol must be one of: " + Object.keys(LIVE_SYMBOLS).join(", ") }, 400);
+
+        // 1. Real candles: 5m for setup, 15m for higher-timeframe context
+        const [c5, c15] = await Promise.all([
+          fetchCandles(env, sym.td, "5min", 60),
+          fetchCandles(env, sym.td, "15min", 30),
+        ]);
+        const atr5 = atr(c5);
+        if (!atr5) return json({ error: "Not enough candle history for ATR" }, 502);
+
+        // 2. Probability estimate from the reasoning model over real numbers
+        const session = currentSession("commodity");
+        const signal = await runJson(
+          env,
+          REASON_MODEL,
+          {
+            messages: [{ role: "user", content: livePrompt(sym, session, c5, c15, atr5) }],
+            max_tokens: 1000,
+          },
+          { jsonMode: true }
+        );
+        finalizeSignal(signal);
+
+        // 3. Trade plan computed server-side from ATR (model never invents levels)
+        const plan = buildTradePlan(signal.direction, c5[c5.length - 1].c, atr5, sym.decimals);
+        signal.entry_timing = signal.direction === "NO_TRADE" ? "" : "market (live feed)";
+
+        let id = null;
+        if (env.DB) {
+          const r = await env.DB.prepare(
+            `INSERT INTO signals (asset, asset_class, session, chart_timeframe, direction, setup_type,
+              entry_timing, expiry_minutes, prob_up, confidence, reasoning, chart_read, low_context,
+              mode, entry_price, sl, tp)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+          )
+            .bind(
+              sym.td, "commodity", session, "M5",
+              signal.direction, signal.setup_type || "none",
+              signal.entry_timing, signal.expiry_minutes,
+              signal.prob_up, signal.confidence, signal.reasoning || "",
+              JSON.stringify({ atr5, last_close: plan.entry_price, candles_5m: c5.length }),
+              0, "live", plan.entry_price, plan.sl, plan.tp
+            )
+            .run();
+          id = r.meta.last_row_id;
+        }
+
+        // Notify the channel on actionable signals only (NO_TRADE stays silent).
+        if (signal.direction !== "NO_TRADE") {
+          ctx.waitUntil(notifyTelegram(env, signalMessage({ asset: sym.td, session, ...signal, ...plan })));
+        }
+
+        return json({ id, asset: sym.td, asset_class: "commodity", session, ...signal, ...plan });
       }
 
       if (url.pathname === "/outcome" && request.method === "POST") {
@@ -385,6 +662,11 @@ export default {
       return json({ error: err.message || String(err) }, 500);
     }
   },
+
+  // Cron (every 5 min): auto-grade open live signals by walking real 1m candles.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(gradeOpenSignals(env));
+  },
 };
 
 /* ------------------------------------------------------------------ */
@@ -424,6 +706,10 @@ textarea{width:100%;margin-top:12px;background:var(--panel2);border:1px solid va
 button{font-family:inherit;font-weight:500;border:none;border-radius:6px;cursor:pointer;font-size:14px}
 .primary{width:100%;margin-top:12px;padding:13px;background:var(--gold);color:#141414;font-weight:700;font-size:15px}
 .primary:disabled{background:var(--flat);color:#222;cursor:wait}
+.liverow{display:flex;gap:10px;flex-wrap:wrap}
+.live{flex:1;min-width:180px;padding:12px;background:var(--panel2);border:1px solid var(--line);color:var(--text);font-weight:600}
+.live:hover{border-color:var(--gold)}
+.live:disabled{opacity:.5;cursor:wait}
 .sig-head{display:flex;justify-content:space-between;align-items:center;padding:16px 18px;border-bottom:1px solid var(--line)}
 .dir{font-size:26px;font-weight:700;letter-spacing:1px}
 .dir.LONG{color:var(--long)} .dir.SHORT{color:var(--short)} .dir.NO_TRADE{color:var(--flat)}
@@ -455,6 +741,14 @@ h2{font-size:14px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);p
 </header>
 
 <div class="wrap">
+  <div class="card"><div class="kente"></div><div class="body">
+    <div class="liverow">
+      <button class="live" data-sym="XAUUSD">Gold (XAU/USD) — live analysis</button>
+      <button class="live" data-sym="XAGUSD">Silver (XAG/USD) — live analysis</button>
+    </div>
+    <div class="err" id="live-err"></div>
+  </div></div>
+
   <div class="card"><div class="kente"></div><div class="body">
     <div class="drop" id="drop">Paste (Ctrl+V), drop, or click to upload a chart screenshot</div>
     <input type="file" id="file" accept="image/*" hidden>
@@ -569,7 +863,7 @@ function render(d){
   <div class="card"><div class="kente"></div>
     <div class="sig-head">
       <div class="dir \${d.direction}">\${dirWord}</div>
-      <div class="conf mono">confidence \${d.confidence}/100</div>
+      <div class="conf mono">P(up) \${d.prob_up}% · lean \${d.confidence}/100</div>
     </div>
     <div class="grid">
       <div class="cell"><div class="k">Asset</div><div class="v">\${d.asset || "unknown"}</div></div>
@@ -596,6 +890,50 @@ async function mark(outcome){
   await api("/outcome", { method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify({ id: lastId, outcome }) });
   loadLog(); loadStats();
+}
+
+// Live metals analysis — no screenshot, the worker pulls real candles.
+document.querySelectorAll(".live").forEach((btn) => (btn.onclick = async () => {
+  const liveErr = $("#live-err");
+  const label = btn.textContent;
+  document.querySelectorAll(".live").forEach((b) => (b.disabled = true));
+  btn.textContent = "Analyzing live feed…"; liveErr.textContent = "";
+  try {
+    const res = await api("/analyze-live", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ symbol: btn.dataset.sym })
+    });
+    const d = await res.json();
+    if (d.error) throw new Error(d.error);
+    lastId = d.id;
+    renderLive(d);
+    loadLog(); loadStats();
+  } catch (ex) { liveErr.textContent = ex.message; }
+  document.querySelectorAll(".live").forEach((b) => (b.disabled = false));
+  btn.textContent = label;
+}));
+
+function renderLive(d){
+  const dirWord = d.direction === "LONG" ? "▲ LONG" : d.direction === "SHORT" ? "▼ SHORT" : "— NO TRADE";
+  $("#result").innerHTML = \`
+  <div class="card"><div class="kente"></div>
+    <div class="sig-head">
+      <div class="dir \${d.direction}">\${dirWord}</div>
+      <div class="conf mono">P(up) \${d.prob_up}% · lean \${d.confidence}/100</div>
+    </div>
+    <div class="grid">
+      <div class="cell"><div class="k">Asset</div><div class="v">\${d.asset}</div></div>
+      <div class="cell"><div class="k">Session</div><div class="v">\${d.session}</div></div>
+      <div class="cell"><div class="k">Setup</div><div class="v">\${d.setup_type || "—"}</div></div>
+      <div class="cell"><div class="k">Entry</div><div class="v mono">\${d.entry_price ?? "—"}</div></div>
+      <div class="cell"><div class="k">Stop-loss</div><div class="v mono">\${d.sl ?? "—"}</div></div>
+      <div class="cell"><div class="k">Take-profit</div><div class="v mono">\${d.tp ?? "—"}</div></div>
+      <div class="cell"><div class="k">R : R</div><div class="v mono">\${d.sl && d.tp ? "1 : 2" : "—"}</div></div>
+    </div>
+    <div class="reason">\${d.reasoning || ""}</div>
+    \${d.direction !== "NO_TRADE" ? \`<div class="reason" style="border-top:none;color:var(--dim)">Outcome auto-grades from the live feed when TP or SL is hit — checked every 5 min, 4h time-stop to breakeven.</div>\` : ""}
+  </div>\`;
 }
 
 async function loadLog(){

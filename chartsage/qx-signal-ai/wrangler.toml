@@ -6,6 +6,10 @@ account_id = "ea2eb3a9813660dfca2a60e594858538"
 [ai]
 binding = "AI"
 
+[triggers]
+# Auto-grades open live signals by walking real 1m candles (TP/SL first-touch)
+crons = ["*/5 * * * *"]
+
 [[d1_databases]]
 binding = "DB"
 database_name = "chartsage-db"

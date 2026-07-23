@@ -12,12 +12,17 @@ CREATE TABLE IF NOT EXISTS signals (
   setup_type TEXT,             -- e.g. trend_continuation | sr_rejection | breakout | mean_reversion
   entry_timing TEXT,           -- e.g. "open of next M1 candle (14:32:00 GMT)"
   expiry_minutes INTEGER,      -- suggested expiry, e.g. 1, 2, 5
-  confidence INTEGER,          -- 0-100 model self-score
+  prob_up INTEGER,             -- model-estimated P(next candle closes up), 0-100
+  confidence INTEGER,          -- 50-100 strength of the lean (max(prob_up, 100-prob_up))
   reasoning TEXT,              -- model's audit trail
   chart_read TEXT,             -- raw vision-model chart description (JSON)
   low_context INTEGER DEFAULT 0, -- 1 if asset could not be identified
   outcome TEXT,                -- win | loss | breakeven | skipped | NULL (pending)
-  outcome_noted_at TEXT
+  outcome_noted_at TEXT,
+  mode TEXT DEFAULT 'screenshot', -- screenshot | live
+  entry_price REAL,            -- live mode: entry at signal time
+  sl REAL,                     -- live mode: stop-loss (1.5x ATR against)
+  tp REAL                      -- live mode: take-profit (3x ATR with, 1:2 R:R)
 );
 
 CREATE INDEX IF NOT EXISTS idx_signals_asset_class ON signals(asset_class);
