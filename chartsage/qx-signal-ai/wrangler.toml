@@ -1,0 +1,12 @@
+name = "chartsage"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+account_id = "ea2eb3a9813660dfca2a60e594858538"
+
+[ai]
+binding = "AI"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "chartsage-db"
+database_id = "18871b09-cd6d-4527-a3f5-cfad12be4908"
