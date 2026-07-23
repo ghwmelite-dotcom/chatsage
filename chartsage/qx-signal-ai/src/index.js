@@ -402,7 +402,7 @@ async function runEngines(env, now, news) {
           `SL/TP from range geometry per documented strategy rules.`,
       };
       await persistLiveSignal(env, sym, session, signal, { engine: setupType, asian: ctx.asian, pdh: ctx.pdh, pdl: ctx.pdl });
-      await notifyTelegram(env, signalMessage({ asset: sym.td, session, ...signal }));
+      await notifySignal(env, signalMessage({ asset: sym.td, session, ...signal }));
     } catch (e) {
       console.error("engine failed for " + key + ": " + (e.message || e));
     }
@@ -921,7 +921,7 @@ async function cryptoScan(env, { symbol = null, notify = true } = {}) {
     );
     emitted.push({ id, ...sig });
     openCount[sig.direction]++;
-    if (notify && sig.grade === "A") await notifyTelegram(env, cryptoSignalMessage(sig));
+    if (notify && sig.grade === "A") await notifySignal(env, cryptoSignalMessage(sig));
   }
   return { scanned: universe.length, emitted, errors, suppressed };
 }
@@ -1071,6 +1071,86 @@ async function backtestOm(env, days) {
   };
 }
 
+/* ------------------------------------------------------------------ */
+/* Risk governor — self-preservation. Locks signal sends to PAPER when  */
+/* the system is bleeding (4 consecutive losses or −5R in 7 days),      */
+/* releases after +3R of paper recovery. Signals always keep generating */
+/* and grading — only the "trade this" endorsement pauses.              */
+/* ------------------------------------------------------------------ */
+
+function tradeR(s) {
+  const risk = Math.abs(s.entry_price - s.sl);
+  if (!risk) return 0;
+  if (s.outcome === "win") return Math.abs(s.tp - s.entry_price) / risk;
+  if (s.outcome === "loss") return -1;
+  return 0;
+}
+
+async function governorState(env) {
+  if (!env.DB) return { locked: false, since: null };
+  try {
+    const { results } = await env.DB.prepare(`SELECT value FROM settings WHERE key='governor_lock'`).all();
+    return { locked: Boolean(results[0]?.value), since: results[0]?.value || null };
+  } catch {
+    return { locked: false, since: null };
+  }
+}
+
+// Signal sends route through here — lockout relabels them as paper.
+async function notifySignal(env, text) {
+  const g = await governorState(env);
+  await notifyTelegram(env, g.locked ? "📄 <b>PAPER — drawdown lockout</b>\n" + text : text);
+}
+
+// Runs after each grading cycle. Engages, recovers, and reports.
+async function updateGovernor(env) {
+  if (!env.DB) return null;
+  const { results: rows } = await env.DB.prepare(
+    `SELECT outcome, entry_price, sl, tp, outcome_noted_at FROM signals
+     WHERE mode='live' AND outcome IN ('win','loss','breakeven')
+     ORDER BY id DESC LIMIT 100`
+  ).all();
+
+  let consec = 0;
+  for (const r of rows) {
+    if (r.outcome === "loss") consec++;
+    else break;
+  }
+  const weekAgo = new Date(Date.now() - 7 * 86400e3).toISOString().slice(0, 19).replace("T", " ");
+  const weekR = rows
+    .filter((r) => (r.outcome_noted_at || "") >= weekAgo)
+    .reduce((a, r) => a + tradeR(r), 0);
+
+  const state = await governorState(env);
+  if (!state.locked && (consec >= 4 || weekR <= -5)) {
+    await env.DB.prepare(
+      `INSERT INTO settings (key, value) VALUES ('governor_lock', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`
+    ).bind(new Date().toISOString()).run();
+    await notifyTelegram(
+      env,
+      `🔒 <b>Risk governor engaged</b> — ${consec} consecutive losses, ${weekR.toFixed(1)}R over 7 days. ` +
+      `Signals continue as PAPER until +3R recovery.`
+    );
+    return { locked: true, consec, weekR };
+  }
+  if (state.locked) {
+    const since = state.since.slice(0, 19).replace("T", " ");
+    const recoveryR = rows
+      .filter((r) => (r.outcome_noted_at || "") >= since)
+      .reduce((a, r) => a + tradeR(r), 0);
+    if (recoveryR >= 3) {
+      await env.DB.prepare(`DELETE FROM settings WHERE key='governor_lock'`).run();
+      await notifyTelegram(
+        env,
+        `🔓 <b>Risk governor released</b> — +${recoveryR.toFixed(1)}R paper recovery. Live signals resumed.`
+      );
+      return { locked: false, consec, weekR, recoveryR };
+    }
+    return { locked: true, consec, weekR, recoveryR };
+  }
+  return { locked: false, consec, weekR };
+}
+
 // Daily 21:05 UTC digest: today's flow, grades, and running engine scoreboard.
 async function dailyDigest(env) {
   if (!env.DB) return;
@@ -1204,6 +1284,7 @@ async function gradeOpenSignals(env) {
   ).all();
 
   const now = Date.now();
+  let resolvedAny = false;
   for (const s of open) {
     const entryMs = new Date(s.created_at.replace(" ", "T") + "Z").getTime();
     const timedOut = now - entryMs > 4 * 3600e3;
@@ -1232,11 +1313,14 @@ async function gradeOpenSignals(env) {
           `UPDATE signals SET outcome=?, outcome_noted_at=datetime('now'), mfe_r=?, mae_r=? WHERE id=?`
         ).bind(resolved, mfe_r, mae_r, s.id).run();
         await notifyTelegram(env, gradeMessage(s, resolved));
+        resolvedAny = true;
       }
     } catch (e) {
       console.error("grading failed for #" + s.id + " " + s.asset + ": " + (e.message || e));
     }
   }
+  // Every grade moves the R ledger — let the governor judge the system.
+  if (resolvedAny) await updateGovernor(env);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1585,7 +1669,7 @@ export default {
         const result = await runLiveAnalysis(env, key);
 
         // Notify the channel on actionable signals only (NO_TRADE stays silent).
-        if (result.direction !== "NO_TRADE") ctx.waitUntil(notifyTelegram(env, signalMessage(result)));
+        if (result.direction !== "NO_TRADE") ctx.waitUntil(notifySignal(env, signalMessage(result)));
 
         return json(result);
       }
@@ -1721,6 +1805,7 @@ export default {
             realized_win_rate: r.n ? Math.round((1000 * r.w) / r.n) / 10 : null,
           })),
           edge: await getEdge(env),
+          governor: await governorState(env),
         });
       }
 
@@ -1790,7 +1875,7 @@ export default {
             if (results[0].n > 0) continue;
 
             const r = await runLiveAnalysis(env, key);
-            if (r.direction !== "NO_TRADE") await notifyTelegram(env, signalMessage(r));
+            if (r.direction !== "NO_TRADE") await notifySignal(env, signalMessage(r));
           } catch (e) {
             console.error("auto-analyze failed for " + key + ": " + (e.message || e));
           }

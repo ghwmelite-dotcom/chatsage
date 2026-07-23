@@ -45,6 +45,9 @@ the screenshot endpoint `/analyze` remains for API use but has no UI. OTC reject
   driver fires; concurrent same-direction crypto capped at 3
 - Calibration loop: nightly 22:05 UTC — realized WR per lean bucket (/stats.calibration);
   edge_override in settings table retunes finalizeSignal's threshold once n>=50
+- Risk governor: settings.governor_lock — 4 consecutive losses or −5R/7d locks
+  signal sends to PAPER (notifySignal wrapper); +3R paper recovery releases;
+  tradeR = +rr win / −1 loss / 0 breakeven
 - /backtest: replays deterministic engines (confluence needs symbol; arb/om capped at 17d
   by Twelve Data fetch depth); replay is an upper bound (no slippage/fees, funding=0)
 - Daily digest 21:05 UTC to Telegram

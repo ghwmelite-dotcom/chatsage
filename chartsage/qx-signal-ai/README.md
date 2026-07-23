@@ -79,6 +79,9 @@ wrangler deploy
   driver fires; concurrent same-direction crypto capped at 3
 - Self-calibration: nightly 22:05 UTC job compares predicted lean vs realized win
   rates; retunes the edge threshold (settings.edge_override) once n>=50 graded
+- Risk governor: 4 consecutive losses or −5R over 7 days locks signal sends to
+  PAPER (signals still generate + grade); +3R paper recovery releases it.
+  State in settings.governor_lock, surfaced at /stats.governor
 - /backtest replays deterministic engines over historical candles (upper bound:
   no slippage/fees; crypto replay uses funding=0/OI neutral)
 - Daily digest to Telegram at 21:05 UTC (flow, grades, engine scoreboard)
