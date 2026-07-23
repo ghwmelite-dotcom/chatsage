@@ -12,9 +12,14 @@ the screenshot endpoint `/analyze` remains for API use but has no UI. OTC reject
   the 00:00–07:00 range; SL opposite end, TP 1.5× width; skip Mondays, range <$8 or >$35
 - `overlap_momentum` (EUR/USD, 12:00–16:00 UTC): first overlap hour sets direction
   (≥15-pip body); SL beyond range + 2-pip buffer, TP 1.5× width; skips Tier-1 news days
-- Engines: one signal per asset per day, checked every 15 min in-window
+- `confluence_a` / `confluence_b` (crypto top-15, hourly at :00): six-pillar stack
+  (4h bias / 1h location / 1h trigger / derivatives / volatility / levels), hard vetoes
+  (funding >0.05%, OI −3%/4h divergence, ATR% outside [0.0015, 0.025], headroom <1.5R);
+  Grade A ≥80 → Telegram, B ≥65 → silent log; graded vs TP1 (1.5R)
+- Engines: one signal per asset per day (crypto: 6h dedupe), checked every 15 min in-window
 - Symbols/config live in `LIVE_SYMBOLS` in src/index.js (per-symbol rulebook class,
-  decimals, auto flag)
+  decimals, auto flag); crypto config in `CRYPTO`
+- Crypto data: Binance fapi primary, Bybit v5 auto-fallback (Binance 403s CF egress IPs)
 
 ## Live deployment
 - Worker: `chartsage` → https://chartsage.ghwmelite.workers.dev

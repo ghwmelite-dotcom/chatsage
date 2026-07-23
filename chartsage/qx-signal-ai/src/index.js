@@ -334,7 +334,7 @@ function detectOverlapMomentum(c5, now = new Date()) {
 /* Shared persistence                                                  */
 /* ------------------------------------------------------------------ */
 
-async function persistLiveSignal(env, sym, session, signal, extra = {}) {
+async function persistLiveSignal(env, sym, session, signal, extra = {}, tf = "M5") {
   if (!env.DB) return null;
   const r = await env.DB.prepare(
     `INSERT INTO signals (asset, asset_class, session, chart_timeframe, direction, setup_type,
@@ -343,7 +343,7 @@ async function persistLiveSignal(env, sym, session, signal, extra = {}) {
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   )
     .bind(
-      sym.td, sym.class, session, "M5",
+      sym.td, sym.class, session, tf,
       signal.direction, signal.setup_type || "none",
       signal.entry_timing || "", signal.expiry_minutes || 1,
       signal.prob_up, signal.confidence, signal.reasoning || "",
@@ -409,7 +409,500 @@ async function runEngines(env, now, news) {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* Crypto confluence engine (deterministic, LLM-free)                  */
+/* Ported from crypto-signal-engine: 4h bias + 1h location/trigger,    */
+/* hard vetoes, six-pillar 0-100 score, Grade A >= 80 / B >= 65.       */
+/* Data: Binance USDT-M futures public API (no key).                   */
+/* ------------------------------------------------------------------ */
+
+const CRYPTO = {
+  TOP: 15,
+  DEDUPE_HOURS: 6,
+  FUNDING_VETO: 0.0005, // 0.05% / 8h
+  OI_DROP_VETO: -3.0, // % over last 4h
+  ATR_PCT_MIN: 0.0015,
+  ATR_PCT_MAX: 0.025,
+  GRADE_A: 80,
+  GRADE_B: 65,
+  BINANCE: "https://fapi.binance.com",
+  BYBIT: "https://api.bybit.com",
+  STABLE_BASES: new Set(["USDC", "TUSD", "FDUSD", "USDP", "DAI", "EUR", "GBP", "BUSD", "AEUR"]),
+};
+
+async function bnJson(path) {
+  const res = await fetch(CRYPTO.BINANCE + path);
+  if (!res.ok) throw new Error("Binance " + res.status + " for " + path);
+  return res.json();
+}
+
+/* ---- Bybit v5 linear (fallback — Binance blocks CF egress IPs) ---- */
+
+const BYBIT_INTERVAL = { "1m": "1", "5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "D" };
+
+async function byJson(path) {
+  const res = await fetch(CRYPTO.BYBIT + path);
+  if (!res.ok) throw new Error("Bybit HTTP " + res.status + " for " + path);
+  const d = await res.json();
+  if (d.retCode !== 0) throw new Error("Bybit " + d.retCode + ": " + d.retMsg);
+  return d.result;
+}
+
+async function byUniverse(top) {
+  const r = await byJson("/v5/market/tickers?category=linear");
+  return r.list
+    .filter((d) => d.symbol.endsWith("USDT") && !CRYPTO.STABLE_BASES.has(d.symbol.slice(0, -4)))
+    .map((d) => ({ symbol: d.symbol, qv: parseFloat(d.turnover24h) }))
+    .sort((a, b) => b.qv - a.qv)
+    .slice(0, top)
+    .map((d) => d.symbol);
+}
+
+async function byKlines(symbol, interval, limit) {
+  const r = await byJson(
+    `/v5/market/kline?category=linear&symbol=${symbol}&interval=${BYBIT_INTERVAL[interval]}&limit=${limit}`
+  );
+  return r.list
+    .map((k) => ({ t: +k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5] }))
+    .reverse(); // bybit returns newest-first
+}
+
+async function byFunding(symbol) {
+  const r = await byJson(`/v5/market/tickers?category=linear&symbol=${symbol}`);
+  return parseFloat(r.list[0].fundingRate) || 0;
+}
+
+async function byOiPct(symbol) {
+  const r = await byJson(`/v5/market/open-interest?category=linear&symbol=${symbol}&intervalTime=5min&limit=48`);
+  if (!r.list || r.list.length < 2) return null;
+  const first = parseFloat(r.list[r.list.length - 1].openInterest);
+  const last = parseFloat(r.list[0].openInterest);
+  return first > 0 ? ((last - first) / first) * 100 : null;
+}
+
+/* ---- provider-fallback wrappers (skill design: Binance primary, Bybit fallback) ---- */
+
+async function withFallback(bnFn, byFn) {
+  try {
+    return await bnFn();
+  } catch {
+    return byFn();
+  }
+}
+
+async function cryptoUniverse(top) {
+  return withFallback(
+    async () => {
+      const data = await bnJson("/fapi/v1/ticker/24hr");
+      return data
+        .filter((d) => d.symbol.endsWith("USDT") && !CRYPTO.STABLE_BASES.has(d.symbol.slice(0, -4)))
+        .map((d) => ({ symbol: d.symbol, qv: parseFloat(d.quoteVolume) }))
+        .sort((a, b) => b.qv - a.qv)
+        .slice(0, top)
+        .map((d) => d.symbol);
+    },
+    () => byUniverse(top)
+  );
+}
+
+// Klines oldest-first with ms open time: { t, o, h, l, c, v }
+async function bnKlines(symbol, interval, limit) {
+  return withFallback(
+    async () => {
+      const data = await bnJson(`/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
+      return data.map((k) => ({ t: k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5] }));
+    },
+    () => byKlines(symbol, interval, limit)
+  );
+}
+
+async function bnFunding(symbol) {
+  return withFallback(
+    async () => {
+      const d = await bnJson(`/fapi/v1/premiumIndex?symbol=${symbol}`);
+      return parseFloat(d.lastFundingRate) || 0;
+    },
+    () => byFunding(symbol)
+  );
+}
+
+async function bnOiPct(symbol) {
+  try {
+    return await withFallback(
+      async () => {
+        const d = await bnJson(`/futures/data/openInterestHist?symbol=${symbol}&period=5m&limit=48`);
+        if (!Array.isArray(d) || d.length < 2) return null;
+        const first = parseFloat(d[0].sumOpenInterest);
+        const last = parseFloat(d[d.length - 1].sumOpenInterest);
+        return first > 0 ? ((last - first) / first) * 100 : null;
+      },
+      () => byOiPct(symbol)
+    );
+  } catch {
+    return null; // OI endpoints blocked in some regions — degrade to neutral
+  }
+}
+
+/* ---- indicators (pandas ewm parity: adjust=False, Wilder alpha=1/n) ---- */
+
+function emaArr(vals, n) {
+  const k = 2 / (n + 1);
+  const out = new Array(vals.length).fill(null);
+  let e = null;
+  for (let i = 0; i < vals.length; i++) {
+    e = e === null ? vals[i] : vals[i] * k + e * (1 - k);
+    out[i] = e;
+  }
+  return out;
+}
+
+function wilderArr(vals, n) {
+  const k = 1 / n;
+  const out = new Array(vals.length).fill(null);
+  let e = null;
+  for (let i = 0; i < vals.length; i++) {
+    if (vals[i] === null || !Number.isFinite(vals[i])) continue;
+    e = e === null ? vals[i] : vals[i] * k + e * (1 - k);
+    if (i >= n - 1) out[i] = e;
+  }
+  return out;
+}
+
+function smaArr(vals, n) {
+  const out = new Array(vals.length).fill(null);
+  let sum = 0;
+  for (let i = 0; i < vals.length; i++) {
+    sum += vals[i];
+    if (i >= n) sum -= vals[i - n];
+    if (i >= n - 1) out[i] = sum / n;
+  }
+  return out;
+}
+
+function addIndicators(cs) {
+  const close = cs.map((c) => c.c), high = cs.map((c) => c.h), low = cs.map((c) => c.l), vol = cs.map((c) => c.v);
+  const ema20 = emaArr(close, 20), ema50 = emaArr(close, 50), ema200 = emaArr(close, 200);
+  const delta = close.map((c, i) => (i ? c - close[i - 1] : 0));
+  const gain = delta.map((d) => Math.max(d, 0)), loss = delta.map((d) => Math.max(-d, 0));
+  const wGain = wilderArr(gain, 14), wLoss = wilderArr(loss, 14);
+  const rsi = close.map((_, i) => {
+    if (wGain[i] === null || wLoss[i] === null) return null;
+    if (wLoss[i] === 0) return null;
+    return 100 - 100 / (1 + wGain[i] / wLoss[i]);
+  });
+  const ema12 = emaArr(close, 12), ema26 = emaArr(close, 26);
+  const macd = close.map((_, i) => ema12[i] - ema26[i]);
+  const tr = close.map((_, i) =>
+    i ? Math.max(high[i] - low[i], Math.abs(high[i] - close[i - 1]), Math.abs(low[i] - close[i - 1])) : high[i] - low[i]
+  );
+  const atr = wilderArr(tr, 14);
+  const up = high.map((h, i) => (i ? h - high[i - 1] : 0));
+  const down = low.map((l, i) => (i ? low[i - 1] - l : 0));
+  const plusDM = up.map((u, i) => (u > down[i] && u > 0 ? u : 0));
+  const minusDM = down.map((d, i) => (d > up[i] && d > 0 ? d : 0));
+  const wPlus = wilderArr(plusDM, 14), wMinus = wilderArr(minusDM, 14);
+  const plusDI = wPlus.map((w, i) => (w === null || !atr[i] ? null : (100 * w) / atr[i]));
+  const minusDI = wMinus.map((w, i) => (w === null || !atr[i] ? null : (100 * w) / atr[i]));
+  const dx = plusDI.map((p, i) => {
+    const m = minusDI[i];
+    if (p === null || m === null || p + m === 0) return null;
+    return (100 * Math.abs(p - m)) / (p + m);
+  });
+  const adx = wilderArr(dx, 14);
+  const volSma = smaArr(vol, 20);
+  return cs.map((c, i) => ({
+    ...c,
+    ema20: ema20[i], ema50: ema50[i], ema200: ema200[i],
+    rsi: rsi[i], macd: macd[i], atr: atr[i], adx: adx[i], volSma20: volSma[i],
+  }));
+}
+
+function dropUnclosed(cs, intervalMs) {
+  if (cs.length && Date.now() - cs[cs.length - 1].t < intervalMs) return cs.slice(0, -1);
+  return cs;
+}
+
+function swingLevels(cs, left = 2, right = 2) {
+  const highs = [], lows = [];
+  for (let i = left; i < cs.length - right; i++) {
+    let isHigh = true, isLow = true;
+    for (let j = i - left; j <= i + right; j++) {
+      if (cs[j].h > cs[i].h) isHigh = false;
+      if (cs[j].l < cs[i].l) isLow = false;
+    }
+    if (isHigh) highs.push(cs[i].h);
+    if (isLow) lows.push(cs[i].l);
+  }
+  return { highs, lows };
+}
+
+/* ---- evaluation (faithful port of analyze.py evaluate_direction) ---- */
+
+const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+const fin = Number.isFinite;
+
+function evaluateDirection(data, direction, funding, oiPct) {
+  const long = direction === "LONG";
+  const d4 = data.d4, d1 = data.d1;
+  const c4 = d4[d4.length - 1], c1 = d1[d1.length - 1];
+  const price = c1.c, atr1 = c1.atr;
+  if (!fin(atr1) || atr1 <= 0) return null;
+
+  // hard veto: volatility regime
+  const atrPct = atr1 / price;
+  if (atrPct < CRYPTO.ATR_PCT_MIN || atrPct > CRYPTO.ATR_PCT_MAX) return null;
+
+  // hard vetoes: derivatives
+  if (long && funding > CRYPTO.FUNDING_VETO) return null;
+  if (!long && funding < -CRYPTO.FUNDING_VETO) return null;
+  const price4hAgo = d1.length >= 5 ? d1[d1.length - 5].c : d1[0].c;
+  const priceChg4h = ((price - price4hAgo) / price4hAgo) * 100;
+  if (oiPct !== null) {
+    if (long && oiPct < CRYPTO.OI_DROP_VETO && priceChg4h > 0) return null;
+    if (!long && oiPct < CRYPTO.OI_DROP_VETO && priceChg4h < 0) return null;
+  }
+
+  // bias (4h)
+  const ema50_4 = c4.ema50, ema20_4 = c4.ema20, ema200_4 = c4.ema200, adx4 = c4.adx;
+  const ema50Prev = d4.length >= 11 ? d4[d4.length - 11].ema50 : null;
+  if (![ema50_4, ema20_4, adx4, ema50Prev].every(fin)) return null;
+  const biasOk = long
+    ? price > ema50_4 && ema50_4 > ema50Prev && adx4 >= 18
+    : price < ema50_4 && ema50_4 < ema50Prev && adx4 >= 18;
+  if (!biasOk) return null;
+
+  // location (1h)
+  const ema20_1 = c1.ema20, ema50_1 = c1.ema50, rsiNow = c1.rsi;
+  if (![ema20_1, ema50_1, rsiNow].every(fin)) return null;
+  const zoneLo = Math.min(ema20_1, ema50_1), zoneHi = Math.max(ema20_1, ema50_1);
+  const pullback = long ? c1.l <= zoneHi && c1.c > ema50_1 : c1.h >= zoneLo && c1.c < ema50_1;
+
+  // retest of a 1h swing level broken within the last 30 bars
+  let retest = false;
+  const look = d1.slice(Math.max(0, d1.length - 31), d1.length - 1);
+  if (look.length >= 10) {
+    if (long) {
+      const lvl = look.length > 3 ? Math.max(...look.slice(0, -3).map((c) => c.h)) : null;
+      if (fin(lvl) && lvl < price) {
+        const broke = d1.slice(-30).some((c) => c.c > lvl);
+        const cameBack = Math.abs(c1.l - lvl) <= 0.5 * atr1 || c1.l <= lvl;
+        retest = broke && cameBack;
+      }
+    } else {
+      const lvl = look.length > 3 ? Math.min(...look.slice(0, -3).map((c) => c.l)) : null;
+      if (fin(lvl) && lvl > price) {
+        const broke = d1.slice(-30).some((c) => c.c < lvl);
+        const cameBack = Math.abs(c1.h - lvl) <= 0.5 * atr1 || c1.h >= lvl;
+        retest = broke && cameBack;
+      }
+    }
+  }
+
+  const recentRsi = d1.slice(Math.max(0, d1.length - 7), d1.length - 1).map((c) => c.rsi);
+  const rsiDip = long
+    ? recentRsi.some((r) => fin(r) && r >= 40 && r <= 50) && rsiNow > 50
+    : recentRsi.some((r) => fin(r) && r >= 50 && r <= 60) && rsiNow < 50;
+  const locationZone = pullback || retest;
+  if (!(locationZone && rsiDip)) return null;
+
+  // trigger (1h last closed candle)
+  const rng = c1.h - c1.l;
+  const body = long ? c1.c - c1.o : c1.o - c1.c;
+  const volMult = c1.volSma20 && fin(c1.volSma20) && c1.volSma20 > 0 ? c1.v / c1.volSma20 : 0;
+  if (rng <= 0) return null;
+  const closePos = long ? (c1.c - c1.l) / rng : (c1.h - c1.c) / rng;
+  if (!(body > 0 && body >= 0.4 * atr1 && closePos >= 0.6 && volMult >= 1.5)) return null;
+
+  // structure: SL / TP / headroom
+  const swingRef = long
+    ? Math.min(...d1.slice(-8).map((c) => c.l))
+    : Math.max(...d1.slice(-8).map((c) => c.h));
+  const sl = long ? swingRef - 0.5 * atr1 : swingRef + 0.5 * atr1;
+  const risk = long ? price - sl : sl - price;
+  if (risk <= 0) return null;
+
+  const { highs: sh4, lows: sl4 } = swingLevels(d4);
+  const opposing = long ? sh4.filter((x) => x > price) : sl4.filter((x) => x < price);
+  const nearest = opposing.length
+    ? long ? Math.min(...opposing) : Math.max(...opposing)
+    : null;
+  let headroomR;
+  if (nearest !== null) {
+    headroomR = long ? (nearest - price) / risk : (price - nearest) / risk;
+    if (headroomR < 1.5) return null; // hard veto: no level room
+  } else {
+    headroomR = 3.0;
+  }
+
+  const tp1 = long ? price + 1.5 * risk : price - 1.5 * risk;
+  let tp2Dist;
+  if (nearest !== null) {
+    tp2Dist = Math.min(Math.abs(nearest - price), 3.0 * risk);
+    tp2Dist = Math.max(tp2Dist, 2.0 * risk);
+  } else {
+    tp2Dist = 3.0 * risk;
+  }
+  const tp2 = long ? price + tp2Dist : price - tp2Dist;
+  const rr = Math.round((Math.abs(tp1 - price) / risk) * 100) / 100;
+
+  // scoring (no veto fired)
+  const tags = [];
+  let align;
+  if (long) {
+    if (price > ema50_4 && ema20_4 > ema50_4 && fin(ema200_4) && ema50_4 > ema200_4) { align = 10; tags.push("4h full EMA alignment"); }
+    else if (price > ema50_4 && ema20_4 > ema50_4) { align = 7; tags.push("4h uptrend"); }
+    else { align = 4; tags.push("4h above EMA50"); }
+  } else {
+    if (price < ema50_4 && ema20_4 < ema50_4 && fin(ema200_4) && ema50_4 < ema200_4) { align = 10; tags.push("4h full EMA alignment (down)"); }
+    else if (price < ema50_4 && ema20_4 < ema50_4) { align = 7; tags.push("4h downtrend"); }
+    else { align = 4; tags.push("4h below EMA50"); }
+  }
+  const slopeRel = Math.abs(ema50_4 - ema50Prev) / ema50_4;
+  const slopePts = Math.round(clamp(slopeRel / 0.01, 0, 1) * 8);
+  const adxPts = Math.round(clamp((adx4 - 18) / 12, 0, 1) * 7);
+  const biasPts = align + slopePts + adxPts;
+
+  let locPts = 0;
+  if (pullback) { locPts += 12; tags.push("EMA20-50 pullback"); }
+  else if (retest) { locPts += 12; tags.push("broken-swing retest"); }
+  if (rsiDip) { locPts += 8; tags.push(long ? "RSI reset 40-50" : "RSI reset 50-60"); }
+
+  const candlePts = Math.round(
+    clamp((body / atr1 - 0.4) / 0.6, 0, 1) * 5 + clamp((closePos - 0.6) / 0.3, 0, 1) * 5
+  );
+  const volPts = Math.round(clamp((volMult - 1.5) / 1.0, 0, 1) * 10);
+  const trigPts = candlePts + volPts;
+  tags.push("volume " + volMult.toFixed(1) + "x");
+
+  const fundPts = (long && funding <= 0) || (!long && funding >= 0) ? 8 : 5;
+  if (Math.abs(funding) <= CRYPTO.FUNDING_VETO) tags.push("funding neutral");
+  let oiPts = 0;
+  if (oiPct !== null) {
+    if (oiPct > 0) { oiPts = 7; tags.push("OI rising " + oiPct.toFixed(1) + "%"); }
+    else { oiPts = 3; tags.push("OI flat/" + oiPct.toFixed(1) + "%"); }
+  }
+  const derivPts = fundPts + oiPts;
+
+  let volRegimePts;
+  if (atrPct >= 0.003 && atrPct <= 0.012) volRegimePts = 10;
+  else if (atrPct < 0.003) volRegimePts = Math.round(clamp((atrPct - CRYPTO.ATR_PCT_MIN) / 0.0015, 0, 1) * 10);
+  else volRegimePts = Math.round(clamp((CRYPTO.ATR_PCT_MAX - atrPct) / (CRYPTO.ATR_PCT_MAX - 0.012), 0, 1) * 10);
+
+  const levelPts = Math.round(clamp((headroomR - 1.5) / 1.0, 0, 1) * 10);
+  tags.push(nearest !== null ? "headroom " + headroomR.toFixed(1) + "R to 4h level" : "no nearby 4h level");
+
+  const score = biasPts + locPts + trigPts + derivPts + volRegimePts + levelPts;
+  if (score < CRYPTO.GRADE_B) return null;
+  const grade = score >= CRYPTO.GRADE_A ? "A" : "B";
+
+  const fmt = (x) => (x >= 1 ? x.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : Number(x.toPrecision(6)).toString());
+  const invalidation = long
+    ? `1h close below ${fmt(sl)} or funding flips > +0.05%`
+    : `1h close above ${fmt(sl)} or funding flips < -0.05%`;
+
+  return {
+    symbol: data.symbol, direction, grade, score,
+    entry: price, sl, tp1, tp2, rr_to_tp1: rr,
+    confluence_tags: tags, invalidation,
+    funding_rate: funding,
+    oi_change_4h_pct: oiPct !== null ? Math.round(oiPct * 1000) / 1000 : null,
+  };
+}
+
+function cryptoEvaluate(data) {
+  if (data.d4.length < 60 || data.d1.length < 60) return null;
+  const results = (["LONG", "SHORT"])
+    .map((dir) => evaluateDirection(data, dir, data.funding, data.oiPct))
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score);
+  return results[0] || null;
+}
+
+/* ---- scan orchestration ---- */
+
+async function loadSymbolData(symbol) {
+  const [d4raw, d1raw, funding, oiPct] = await Promise.all([
+    bnKlines(symbol, "4h", 250),
+    bnKlines(symbol, "1h", 250),
+    bnFunding(symbol),
+    bnOiPct(symbol),
+  ]);
+  return {
+    symbol,
+    d4: addIndicators(dropUnclosed(d4raw, 4 * 3600e3)),
+    d1: addIndicators(dropUnclosed(d1raw, 3600e3)),
+    funding,
+    oiPct,
+  };
+}
+
+function cryptoSignalMessage(s) {
+  const icon = s.direction === "LONG" ? "🟢" : "🔴";
+  const fmt = (x) => (x >= 1 ? x.toLocaleString("en-US", { maximumFractionDigits: 2 }) : Number(x.toPrecision(6)).toString());
+  return [
+    `${icon} <b>SIGNAL — ${s.symbol} ${s.direction} (Grade ${s.grade}, ${s.score}/100)</b>`,
+    `Entry: ${fmt(s.entry)} | SL: ${fmt(s.sl)} | TP1: ${fmt(s.tp1)} | TP2: ${fmt(s.tp2)} | R:R ${s.rr_to_tp1}`,
+    `Confluence: ${s.confluence_tags.join(" + ")}`,
+    `<i>${s.invalidation}</i>`,
+  ].join("\n");
+}
+
+// Scan the universe (or one symbol); persist + notify. Deterministic — no LLM.
+async function cryptoScan(env, { symbol = null, notify = true } = {}) {
+  const universe = symbol ? [symbol.toUpperCase()] : await cryptoUniverse(CRYPTO.TOP);
+  const emitted = [];
+  const errors = [];
+  const since = new Date(Date.now() - CRYPTO.DEDUPE_HOURS * 3600e3).toISOString().slice(0, 19).replace("T", " ");
+
+  // modest concurrency
+  const queue = [...universe];
+  const workers = Array.from({ length: 4 }, async () => {
+    while (queue.length) {
+      const sym = queue.shift();
+      try {
+        const data = await loadSymbolData(sym);
+        const sig = cryptoEvaluate(data);
+        if (!sig) continue;
+
+        // dedupe: same symbol+direction within 6h
+        const { results: dup } = await env.DB.prepare(
+          `SELECT COUNT(*) AS n FROM signals WHERE mode='live' AND asset=? AND direction=? AND created_at >= ?`
+        ).bind(sym, sig.direction, since).all();
+        if (dup[0].n > 0) continue;
+
+        const signal = {
+          direction: sig.direction,
+          setup_type: "confluence_" + sig.grade.toLowerCase(),
+          prob_up: sig.direction === "LONG" ? sig.score : 100 - sig.score,
+          confidence: sig.score,
+          expiry_minutes: 1,
+          entry_timing: "market (live feed)",
+          entry_price: sig.entry,
+          sl: sig.sl,
+          tp: sig.tp1, // graded against TP1; TP2 kept in chart_read
+          reasoning: `Grade ${sig.grade} confluence (${sig.score}/100): ${sig.confluence_tags.join(" + ")}. ${sig.invalidation}`,
+        };
+        const id = await persistLiveSignal(
+          env,
+          { td: sym, class: "crypto" },
+          "n/a",
+          signal,
+          { engine: "confluence", grade: sig.grade, score: sig.score, tp1: sig.tp1, tp2: sig.tp2, rr: sig.rr_to_tp1, funding: sig.funding_rate, oi_pct: sig.oi_change_4h_pct, tags: sig.confluence_tags },
+          "H1"
+        );
+        emitted.push({ id, ...sig });
+        if (notify && sig.grade === "A") await notifyTelegram(env, cryptoSignalMessage(sig));
+      } catch (e) {
+        errors.push(sym + ": " + (e.message || e));
+      }
+    }
+  });
+  await Promise.all(workers);
+  return { scanned: universe.length, emitted, errors };
+}
+
 // Telegram channel notifications — fire-and-forget, never breaks a request.
+
 async function notifyTelegram(env, text) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
   try {
@@ -480,10 +973,21 @@ async function runLiveAnalysis(env, symKey) {
   return { id, asset: sym.td, asset_class: sym.class, session, ...signal, ...plan };
 }
 
+// Grading candles normalized to ms timestamps. Crypto (…USDT) grades from
+// Binance 1m; everything else from Twelve Data 1m.
+async function fetchGradingCandles(env, asset) {
+  if (asset.endsWith("USDT")) {
+    const cs = await bnKlines(asset, "1m", 240);
+    return cs.map((c) => ({ tMs: c.t, h: c.h, l: c.l }));
+  }
+  const cs = await fetchCandles(env, asset, "1min", 240);
+  return cs.map((c) => ({ tMs: new Date(c.t.replace(" ", "T") + "Z").getTime(), h: c.h, l: c.l }));
+}
+
 // Walk 1m candles since entry: first TP touch = win, first SL touch = loss
 // (if both inside one candle, count it a loss — conservative).
 async function gradeOpenSignals(env) {
-  if (!env.TWELVE_DATA_KEY || !env.DB) return;
+  if (!env.DB) return;
   const { results: open } = await env.DB.prepare(
     `SELECT id, asset, direction, entry_price, sl, tp, created_at FROM signals
      WHERE mode = 'live' AND outcome IS NULL AND direction != 'NO_TRADE' AND sl IS NOT NULL`
@@ -498,18 +1002,22 @@ async function gradeOpenSignals(env) {
       await notifyTelegram(env, gradeMessage(s, "breakeven"));
       continue;
     }
-    const candles = await fetchCandles(env, s.asset, "1min", 240);
-    for (const c of candles) {
-      if (new Date(c.t.replace(" ", "T") + "Z").getTime() <= entryMs) continue;
-      const hitSL = s.direction === "LONG" ? c.l <= s.sl : c.h >= s.sl;
-      const hitTP = s.direction === "LONG" ? c.h >= s.tp : c.l <= s.tp;
-      if (hitSL || hitTP) {
-        const outcome = hitSL ? "loss" : "win";
-        await env.DB.prepare(`UPDATE signals SET outcome=?, outcome_noted_at=datetime('now') WHERE id=?`)
-          .bind(outcome, s.id).run();
-        await notifyTelegram(env, gradeMessage(s, outcome));
-        break;
+    try {
+      const candles = await fetchGradingCandles(env, s.asset);
+      for (const c of candles) {
+        if (c.tMs <= entryMs) continue;
+        const hitSL = s.direction === "LONG" ? c.l <= s.sl : c.h >= s.sl;
+        const hitTP = s.direction === "LONG" ? c.h >= s.tp : c.l <= s.tp;
+        if (hitSL || hitTP) {
+          const outcome = hitSL ? "loss" : "win";
+          await env.DB.prepare(`UPDATE signals SET outcome=?, outcome_noted_at=datetime('now') WHERE id=?`)
+            .bind(outcome, s.id).run();
+          await notifyTelegram(env, gradeMessage(s, outcome));
+          break;
+        }
       }
+    } catch (e) {
+      console.error("grading failed for #" + s.id + " " + s.asset + ": " + (e.message || e));
     }
   }
 }
@@ -729,7 +1237,7 @@ const json = (obj, status = 200) =>
     headers: { "Content-Type": "application/json" },
   });
 
-const PROTECTED_PATHS = new Set(["/analyze", "/analyze-live", "/outcome", "/signals", "/stats"]);
+const PROTECTED_PATHS = new Set(["/analyze", "/analyze-live", "/analyze-crypto", "/outcome", "/signals", "/stats"]);
 
 export default {
   async fetch(request, env, ctx) {
@@ -801,6 +1309,12 @@ export default {
         // Notify the channel on actionable signals only (NO_TRADE stays silent).
         if (result.direction !== "NO_TRADE") ctx.waitUntil(notifyTelegram(env, signalMessage(result)));
 
+        return json(result);
+      }
+
+      if (url.pathname === "/analyze-crypto" && request.method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        const result = await cryptoScan(env, { symbol: body.symbol || null, notify: true });
         return json(result);
       }
 
@@ -893,7 +1407,8 @@ export default {
   },
 
   // Cron (every 5 min): grade open signals; mechanical engines every 15 min
-  // inside their windows; probabilistic auto-analysis at :00/:30 (07-21 UTC).
+  // inside their windows; probabilistic auto-analysis at :00/:30 (07-21 UTC);
+  // crypto confluence scan hourly at :00 (24/7 market, news blackout respected).
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
       (async () => {
@@ -901,10 +1416,20 @@ export default {
 
         const t = new Date(event.scheduledTime || Date.now());
         const h = t.getUTCHours(), m = t.getUTCMinutes();
+        const news = newsGuard(t);
+
+        // Crypto scan: hourly, 24/7, skipped only inside a Tier-1 release
+        if (m < 5 && !news.blackout) {
+          try {
+            await cryptoScan(env, { notify: true });
+          } catch (e) {
+            console.error("crypto scan failed: " + (e.message || e));
+          }
+        }
+
         if (!marketOpen(t)) return; // weekend / Friday close — no analysis on stale data
         if (h < 7 || h >= 21) return;
 
-        const news = newsGuard(t);
         if (m % 15 < 5 && !news.blackout) await runEngines(env, t, news);
 
         if (m % 30 >= 5 || news.blackout) return; // probabilistic analysis at :00/:30, never inside a release
@@ -995,6 +1520,7 @@ h2{font-size:14px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);p
     <div class="liverow">
       <button class="live" data-sym="XAUUSD">Gold (XAU/USD) — live analysis</button>
       <button class="live" data-sym="EURUSD">EUR/USD — live analysis</button>
+      <button class="live" id="crypto-btn">Crypto top-15 — confluence scan</button>
     </div>
     <div class="err" id="live-err"></div>
   </div></div>
@@ -1072,6 +1598,46 @@ function renderLive(d){
     <div class="reason">\${d.reasoning || ""}</div>
     \${d.direction !== "NO_TRADE" ? \`<div class="reason" style="border-top:none;color:var(--dim)">Outcome auto-grades from the live feed when TP or SL is hit — checked every 5 min, 4h time-stop to breakeven.</div>\` : ""}
   </div>\`;
+}
+
+// Crypto confluence scan — deterministic six-pillar engine over the top-15 universe.
+$("#crypto-btn").onclick = async (e) => {
+  const btn = e.currentTarget, liveErr = $("#live-err");
+  const label = btn.textContent;
+  document.querySelectorAll(".live").forEach((b) => (b.disabled = true));
+  btn.textContent = "Scanning top-15…"; liveErr.textContent = "";
+  try {
+    const res = await api("/analyze-crypto", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    });
+    const d = await res.json();
+    if (d.error) throw new Error(d.error);
+    renderCrypto(d);
+    loadLog(); loadStats();
+  } catch (ex) { liveErr.textContent = ex.message; }
+  document.querySelectorAll(".live").forEach((b) => (b.disabled = false));
+  btn.textContent = label;
+};
+
+function renderCrypto(d){
+  const fmt = (x) => (x >= 1 ? Number(x).toLocaleString("en-US", { maximumFractionDigits: 2 }) : Number(x).toPrecision(6));
+  let html = '<div class="card"><div class="kente"></div><div class="sig-head"><div class="dir">CRYPTO SCAN</div>' +
+    '<div class="conf mono">' + d.scanned + " scanned · " + d.emitted.length + " emitted</div></div>";
+  if (!d.emitted.length) {
+    html += '<div class="reason">No A/B-grade confluence setups this scan — the six-pillar stack stayed silent. That is the filter working, not a bug.</div>';
+  }
+  for (const s of d.emitted) {
+    html += '<div class="reason" style="border-top:1px solid var(--line)">' +
+      '<div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px">' +
+      '<span class="dir ' + s.direction + '" style="font-size:16px">' + s.symbol + " " + s.direction + "</span>" +
+      '<span class="mono" style="color:var(--gold)">Grade ' + s.grade + " · " + s.score + "/100</span></div>" +
+      '<div class="mono" style="margin-top:6px;color:#c4cdd8">Entry ' + fmt(s.entry) + " · SL " + fmt(s.sl) + " · TP1 " + fmt(s.tp1) + " · TP2 " + fmt(s.tp2) + " · R:R " + s.rr_to_tp1 + "</div>" +
+      '<div style="margin-top:4px">' + s.confluence_tags.join(" + ") + "</div>" +
+      '<div style="margin-top:4px;color:var(--dim)">' + s.invalidation + "</div></div>";
+  }
+  $("#result").innerHTML = html + "</div>";
 }
 
 async function loadLog(){

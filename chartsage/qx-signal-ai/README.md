@@ -12,6 +12,12 @@ Signal analyst for real markets on Cloudflare Workers (free tier). Two modes:
   00:00–07:00 range, SL opposite end, TP 1.5× width) and EUR/USD Overlap Momentum
   (first 12:00–13:00 hour sets direction, SL beyond the hour's range, TP 1.5× width).
   One engine signal per asset per day, tagged with its own `setup_type` in `/stats`.
+- **Crypto confluence engine** — hourly scan of the top-15 USDT-M perpetuals
+  (Binance primary, Bybit auto-fallback). Deterministic six-pillar stack:
+  4h bias (EMA50 slope + ADX), 1h location (EMA20–50 pullback / broken-swing retest
+  + RSI reset), 1h trigger (body/volume/close-position), hard vetoes (funding
+  extreme, OI divergence, volatility regime, level headroom < 1.5R). Grade A ≥ 80
+  posts to Telegram, B ≥ 65 logs silently. Graded against TP1 (1.5R) from Binance 1m.
 - **Screenshot (API-only legacy)** — `POST /analyze` still works for real-feed chart
   screenshots, but the upload UI was removed; the landing page is live-analysis only.
   OTC pairs are **rejected** — they are broker-generated feeds with no public tape.
