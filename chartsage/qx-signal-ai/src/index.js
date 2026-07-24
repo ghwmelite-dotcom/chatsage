@@ -429,7 +429,8 @@ async function runEngines(env, now, news) {
         reasoning: `Mechanical ${setupType.replace(/_/g, " ")}: ${det.note}. ` +
           `SL/TP from range geometry per documented strategy rules.`,
       };
-      await persistLiveSignal(env, sym, session, signal, { engine: setupType, asian: ctx.asian, pdh: ctx.pdh, pdl: ctx.pdl });
+      const engineId = await persistLiveSignal(env, sym, session, signal, { engine: setupType, asian: ctx.asian, pdh: ctx.pdh, pdl: ctx.pdl });
+      if (engineId) await publishToEdgeRelay(env, { ...signal, assetKey: key }, engineId);
       await notifySignal(env, signalMessage({ asset: sym.td, session, ...signal }));
     } catch (e) {
       console.error("engine failed for " + key + ": " + (e.message || e));
@@ -1286,6 +1287,9 @@ async function runLiveAnalysis(env, symKey) {
     atr5, last_close: plan.entry_price, candles_5m: c5.length,
     asian: ctx.asian, pdh: ctx.pdh, pdl: ctx.pdl,
   });
+  if (id && signal.direction !== "NO_TRADE") {
+    await publishToEdgeRelay(env, { ...signal, ...plan, assetKey: symKey }, id);
+  }
 
   return { id, asset: sym.td, asset_class: sym.class, session, ...signal, ...plan };
 }
@@ -1790,6 +1794,80 @@ async function buildDataPack(env) {
     recent_signals: recent.results,
     note: "win rates need n>=30 to mean anything; R multiples: win=+RR, loss=-1R",
   };
+}
+
+/* ------------------------------------------------------------------ */
+/* EdgeRelay publisher — Phase 5: ChartSage as a virtual master.        */
+/* Actionable gold/EUR signals are HMAC-signed and pushed to EdgeRelay  */
+/* signal-ingestion; Follower EAs on subscribers' MT5 execute them with */
+/* the signal's own SL/TP on the broker's tape. Crypto is excluded:     */
+/* perp prices don't map to broker CFD feeds. Governor lockout = no     */
+/* publishing (paper signals stay in-house).                            */
+/* ------------------------------------------------------------------ */
+
+const EDGERELAY_INGEST = "https://edgerelay-signal-ingestion.ghwmelite.workers.dev/v1/ingest";
+const EDGERELAY_SYMBOLS = { XAUUSD: "XAUUSD", EURUSD: "EURUSD" };
+
+async function hmacSha256Hex(secret, message) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// EdgeRelay canonical form: all fields except hmac_signature, keys sorted, compact.
+function canonicalJson(payload) {
+  return (
+    "{" +
+    Object.keys(payload)
+      .sort()
+      .map((k) => JSON.stringify(k) + ":" + JSON.stringify(payload[k]))
+      .join(",") +
+    "}"
+  );
+}
+
+// Fire-and-forget publish — never blocks or breaks signal generation.
+async function publishToEdgeRelay(env, signal, id) {
+  if (!env.EDGERELAY_ACCOUNT_ID || !env.EDGERELAY_API_SECRET) return;
+  const symbol = EDGERELAY_SYMBOLS[signal.assetKey];
+  if (!symbol || signal.direction === "NO_TRADE") return;
+  if ((await governorState(env)).locked) return; // paper mode stays in-house
+
+  const payload = {
+    signal_id: "chartsage-" + id,
+    account_id: env.EDGERELAY_ACCOUNT_ID,
+    sequence_num: id, // D1 ids are monotonic — doubles as dedup guard
+    action: "open",
+    order_type: signal.direction === "LONG" ? "buy" : "sell",
+    symbol,
+    volume: 0.1, // nominal; followers size by their own lot mode
+    sl: signal.sl,
+    tp: signal.tp,
+    magic_number: 880001,
+    ticket: id,
+    comment: "ChartSage " + (signal.setup_type || "signal"),
+    timestamp: Math.floor(Date.now() / 1000),
+    source_platform: "mt5",
+  };
+  payload.hmac_signature = await hmacSha256Hex(env.EDGERELAY_API_SECRET, canonicalJson(payload));
+
+  try {
+    const res = await fetch(EDGERELAY_INGEST, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const out = await res.json().catch(() => ({}));
+    if (!res.ok) console.error("edgerelay ingest " + res.status + ": " + JSON.stringify(out).slice(0, 200));
+  } catch (e) {
+    console.error("edgerelay publish failed: " + (e.message || e));
+  }
 }
 
 /* ------------------------------------------------------------------ */
